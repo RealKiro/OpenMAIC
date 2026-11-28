@@ -139,6 +139,18 @@ describe('authoritative product guidance', () => {
     );
   });
 
+  it('requests a visible acknowledgment during guided review only', () => {
+    const feedback = 'acknowledge it once in learner-facing prose';
+    for (const index of [0, 2, 3, 6]) {
+      const prompt = renderTeachingPrompt(fixture(index)).systemPrompt;
+      expect(prompt).toContain(feedback);
+      expect(prompt).toContain('before calling complete_stage in the same turn');
+    }
+    for (const index of [1, 4, 5]) {
+      expect(renderTeachingPrompt(fixture(index)).systemPrompt).not.toContain(feedback);
+    }
+  });
+
   it.each([0, 2, 6])(
     'preserves feedback coverage and pacing in guided stage %s, beyond recap alone',
     (index) => {
@@ -170,20 +182,20 @@ describe('authoritative product guidance', () => {
     },
   );
 
-  it('names the visible task trigger and directs decisions to a presentation-only drawer link', () => {
+  it('names the decision action and offers the localized task link only as a fallback', () => {
     const input = fixture(1);
     const context = teachingProductContext({ ...input, uiLocale: 'zh-CN' });
     expect(context.visibleLabels.task).toBe('当前任务');
     expect(context.taskLink).toBe('#pbl-task');
     expect(context.current.taskDrawer).toBe(true);
     const prompt = renderTeachingPrompt(input).systemPrompt;
-    expect(prompt).toContain('open the task drawer from that task bar');
-    expect(prompt).toContain('text is exactly productContext.visibleLabels.task');
-    expect(prompt).toContain('name the task bar at the bottom of the Learning Assistant pane');
-    expect(prompt).toContain('only when current.chatSupported is true');
-    expect(prompt).toContain('also applies to the final bold instruction');
-    expect(prompt).toContain('not by sending a chat message');
+    expect(prompt).toContain("Lead with the learner's action");
+    expect(prompt).toContain('visibleLabels.submitDecision');
+    expect(prompt).toContain('If you cannot see the form, open [Current task](#pbl-task)');
+    expect(prompt).toContain('only when current.taskDrawer is true');
+    expect(prompt).toContain('visibleLabels.resubmit');
     expect(prompt).toContain('does not submit, save, approve or advance');
+    expect(prompt).not.toContain('bottom of the Learning Assistant pane');
     expect(teachingProductContext(fixture(0)).current.taskDrawer).toBe(true);
     expect(teachingProductContext(fixture(0)).current.taskContents).toContain(
       'current milestone goal and outcome',
@@ -492,9 +504,7 @@ describe('authoritative product guidance', () => {
   it('does not give Continue directions while the welcome is waiting for a chat readiness reply', () => {
     const prompt = renderTeachingPrompt({ ...fixture(0), welcome: 'pending' }).systemPrompt;
     expect(prompt).toContain('Project readiness is a chat reply, not a Continue button');
-    expect(prompt).not.toContain(
-      'the learner uses the task bar at the bottom of the Learning Assistant pane to enter',
-    );
+    expect(prompt).not.toContain('the learner chooses the named next-step button to enter');
   });
 
   it.each([1, 4, 5])(

@@ -60,6 +60,8 @@ export type SlotSource = 'default' | 'workspace' | 'locked';
 export interface ModelConfigLayer {
   source: ConfigSource;
   config: ModelConfigFile;
+  /** Stored workspace revision, when this layer came from the settings database. */
+  revision?: number;
 }
 
 /** Where a model comes from: one declared provider and one of its models. */
@@ -225,7 +227,9 @@ function resolveTarget(
         : `${at}: the provider has an unknown preset`,
     );
   }
-  const target = preset.capabilities[capability];
+  const target = provider.unsupportedCapabilities?.includes(capability)
+    ? undefined
+    : preset.capabilities[capability];
   if (!target) {
     throw new SlotResolutionError(
       `${at}: the provider (preset "${preset.id}") does not offer ${capability}`,

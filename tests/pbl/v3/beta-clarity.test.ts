@@ -4,7 +4,7 @@ import { describe, expect, it, vi } from 'vitest';
 vi.mock('server-only', () => ({}));
 import { installedProject } from '@/lib/server/pbl-v3/catalog';
 import { startOrchestration } from '@/lib/pbl/v3/domain/orchestration/transition';
-import { continueActionLabel } from '@/lib/pbl/v3/presentation';
+import { continueActionLabel, stageCompletionCopy } from '@/lib/pbl/v3/presentation';
 import { visibleProductLabels } from '@/lib/server/pbl-v3/ui-labels';
 import { teachingProductContext } from '@/lib/server/pbl-v3/product-context';
 import { renderTeachingPrompt, teachingSection } from '@/lib/server/pbl-v3/teaching-prompt';
@@ -67,6 +67,7 @@ describe('learner-facing actions', () => {
     for (let index = 0; index < expected.length; index++) {
       const input = fixture(index);
       const view = {
+        actions: ['next'],
         state: input.workspace!.state,
         milestones: [
           {
@@ -77,6 +78,20 @@ describe('learner-facing actions', () => {
       };
       const action = continueActionLabel(view, i18n.t);
       expect(action).toBe(expected[index]);
+      expect(
+        stageCompletionCopy({ ...view, actions: [] }, i18n.t, false).instruction,
+      ).toBeUndefined();
+      expect(stageCompletionCopy(view, i18n.t, true).instruction).toBeUndefined();
+      const classic = stageCompletionCopy(view, i18n.t, false);
+      expect(classic.instruction).toContain(`“${action}”`);
+      expect(classic.afterMention).toBeUndefined();
+      const onBoard = stageCompletionCopy(
+        { ...view, explainBoard: { whiteboard: null, lastSeq: null, pages: [] } },
+        i18n.t,
+        false,
+      );
+      expect(onBoard.instruction).toBe(classic.instruction);
+      expect(onBoard.afterMention?.label).toBe(index < expected.length - 1 ? action : undefined);
       const context = teachingProductContext({ ...input, uiLocale: 'zh-CN' });
       expect(context.visibleLabels.continue).toBe(action);
       expect(context.labels.continue.zh).toBe(action);
@@ -84,9 +99,7 @@ describe('learner-facing actions', () => {
       expect(i18n.t('pblV3.testResult.hints.passed', { action })).toContain(`“${action}”`);
     }
     // Historical completion messages must not claim a button for a different/current stage.
-    expect(i18n.t('pblV3.journey.completionHandoff')).toBe(
-      '本环节已完成。下一步操作请看学习助手底部的任务栏。',
-    );
+    expect(i18n.t('pblV3.journey.completionHandoff')).toBe('本环节已完成。');
     expect(teachingProductContext(fixture(0)).current.continueAvailableAfterReply).toBe(false);
     const completed = fixture(0);
     completed.collected.teachingCompleted = true;
@@ -120,7 +133,7 @@ describe('learner-facing actions', () => {
     const action = continueActionLabel(view, i18n.t);
     expect(action).toBe('进入下一阶段');
     expect(i18n.t('pblV3.journey.ready', { action })).toBe(
-      '本环节已就绪，准备好后点击“进入下一阶段”。',
+      '本环节已就绪，“进入下一阶段”按钮已可用。',
     );
     const context = teachingProductContext({
       ...input,
@@ -199,10 +212,11 @@ describe('selective task emphasis and readable plans', () => {
       const input = fixture(index);
       const prompt = renderTeachingPrompt(input).systemPrompt;
       expect(prompt).toContain(learnerExpressionRules);
-      expect(prompt).toContain('不强制添加行动段');
-      expect(prompt).toContain('只提交一份完整回复');
+      expect(prompt).toContain('need no action paragraph');
+      expect(prompt).toContain('submit one complete reply');
       if (input.stage.kind === 'check') {
         expect(prompt).toContain('do not require any chat answer');
+        expect(prompt).not.toContain('task-bar button');
         expect(prompt).toContain(
           'Never read_next_skill, request_skill_review or complete_stage here',
         );

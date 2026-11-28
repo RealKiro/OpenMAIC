@@ -243,6 +243,54 @@ describe('self-contained PBL project packages', () => {
       }
     },
   );
+  it.each([
+    [' ', ' Why this rule? ', undefined, 'Why this rule?'],
+    [' Your rule ', { legacy: true }, 'Your rule', undefined],
+    ['x'.repeat(81), 'y'.repeat(80), undefined, 'y'.repeat(80)],
+  ])(
+    'reads decision labels independently on install and reload (%#)',
+    (answer, reason, expectedAnswer, expectedReason) => {
+      const bundle = revised((files) => {
+        const descriptor = JSON.parse(files['project.json']);
+        Object.assign(descriptor.definition.decisions[0], {
+          responseType: 'text',
+          requiresRationale: true,
+          responseLabel: answer,
+          rationaleLabel: reason,
+        });
+        files['project.json'] = JSON.stringify(descriptor);
+      });
+      for (const purpose of ['install', 'resolve'] as const) {
+        const { project } = validateProjectPackage(bundle, purpose);
+        const decision = project.definition.decisions[0]!;
+        expect(decision.responseLabel).toBe(expectedAnswer);
+        expect(decision.rationaleLabel).toBe(expectedReason);
+        expect(project.coursePackage!.bundle.files['project.json']).toBe(
+          bundle.files['project.json'],
+        );
+      }
+    },
+  );
+  it('round-trips a role voice and ignores malformed legacy voice metadata on its own role', async () => {
+    const voice = { providerId: 'custom-tts-studio', modelId: 'studio-v1', voiceId: 'guide' };
+    const bundle = revised((files) => {
+      const descriptor = JSON.parse(files['project.json']);
+      descriptor.definition.agents.mentor.voiceConfig = voice;
+      descriptor.definition.agents.planner.voiceConfig = { ...voice, voiceId: ' ' };
+      descriptor.definition.agents.coder.voiceConfig = { ...voice, baseUrl: 'not a voice field' };
+      files['project.json'] = JSON.stringify(descriptor);
+    });
+    const [loaded] = await readClassroomProjects(await archive(bundle), [bundle.entry]);
+    for (const purpose of ['install', 'resolve'] as const) {
+      const { project } = validateProjectPackage(loaded, purpose);
+      const { mentor, discussion, planner, coder } = project.definition.agents;
+      expect(mentor.voiceConfig).toEqual(voice);
+      expect(discussion.voiceConfig).toBeUndefined();
+      expect(planner.voiceConfig).toBeUndefined();
+      expect(coder.voiceConfig).toBeUndefined();
+      expect(project.coursePackage?.bundle).toEqual(bundle);
+    }
+  });
   it('retains the pre-existing quiz answer range guard on both installation and resolution', () => {
     const bundle = revised((files) => {
       const spec = JSON.parse(files['project.json']);
@@ -737,17 +785,21 @@ describe('self-contained PBL project packages', () => {
       spec.definition.decisions[0].requiresRationale = true;
       spec.definition.decisions[0].responseType = 'text';
       spec.definition.decisions[0].options = [];
+      spec.definition.decisions[0].responseLabel = 'Your rule';
+      spec.definition.decisions[0].rationaleLabel = 'Why this rule works';
       files['project.json'] = JSON.stringify(spec);
     });
     const m = manifest();
     const fetcher = vi.spyOn(globalThis, 'fetch').mockImplementation(async (_url, init) => {
       const input = JSON.parse(init!.body as string);
-      if (input.action === 'install')
+      if (input.action === 'install') {
+        expect(input.projects).toEqual([bundle]);
         return Response.json({
           references: [
             { ...source().ref, assetId: 'installed-template', checksum: bundle.entry.checksum },
           ],
         });
+      }
       return Response.json({ projects: input.refs.map(() => bundle) });
     });
     try {

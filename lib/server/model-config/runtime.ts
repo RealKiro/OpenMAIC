@@ -11,6 +11,7 @@
  */
 import { ModelAuthorizationError } from './model-authorization';
 import { slotForStage, type SlotCapability, type SlotId } from '@/lib/config/model-slots';
+import { PROVIDER_MIGRATION_NOTICE } from '@/lib/config/provider-migration';
 import { createLogger } from '@/lib/logger';
 import type { LlmStage } from '@/lib/server/model-routes';
 import type { OwnerAuthRequest } from '@/lib/server/identity/types';
@@ -36,14 +37,18 @@ const globalState = globalThis as typeof globalThis & { [STATE_KEY]?: Deployment
 /**
  * The deployment layer, loaded on first use and kept for
  * the life of the process (openmaic.yml applies on restart). Startup calls
- * this so that a broken file or a leftover MODEL_ROUTES stops the server
+ * this so that a broken deployment file stops the server
  * before it serves anything, and prints the notices once.
  */
 export function deploymentConfig(): DeploymentLayer {
   const cached = globalState[STATE_KEY];
   if (cached) return cached;
   const loaded = loadDeploymentLayer();
-  for (const notice of loaded.notices) log.warn(notice);
+  for (const notice of loaded.notices) {
+    // Operators need the migration diagnostic even when warnings are suppressed.
+    if (notice.startsWith(PROVIDER_MIGRATION_NOTICE)) log.error(notice);
+    else log.warn(notice);
+  }
   globalState[STATE_KEY] = loaded;
   return loaded;
 }
@@ -116,7 +121,7 @@ export async function workspaceLayer(ownerId: string): Promise<ModelConfigLayer 
       `Workspace keys for ${stored.unreadableSecrets.length} provider(s) cannot be read with the current instance secret; they have to be entered again`,
     );
   }
-  return { source: 'workspace', config: stored.config };
+  return { source: 'workspace', config: stored.config, revision: stored.revision };
 }
 
 /**
@@ -220,11 +225,19 @@ export function lookupFromLayers(
 export async function lookupSlot(
   slot: SlotId,
   workspaceId: string | null,
+  expectedRevision?: number,
 ): Promise<SlotResolution> {
   const { layer } = deploymentConfig();
   const workspace = workspaceId ? await (loadWorkspace ?? workspaceLayer)(workspaceId) : null;
+  if (expectedRevision !== undefined && expectedRevision !== (workspace?.revision ?? 0)) {
+    throw new StaleWorkspaceSettingsError(
+      'The model settings have changed. Reopen the settings and try again.',
+    );
+  }
   return lookupFromLayers(slot, { deployment: layer, workspace });
 }
+
+export class StaleWorkspaceSettingsError extends Error {}
 
 /** {@link lookupSlot} for a call site that knows its stage key. */
 export function lookupStage(stage: LlmStage, workspaceId: string | null): Promise<SlotResolution> {

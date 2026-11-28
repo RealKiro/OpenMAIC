@@ -1,6 +1,7 @@
 import { HOST_STATE_START, HOST_STATE_END } from '@/lib/ai/request-state-tail';
 import { requestStateTail } from '@/lib/agent/runtime/request-state-tail';
 /** Real PG + local Python execution. Model decisions are driven explicitly through the role tools. No cloud or live model calls. */
+import { narrationSteps, recoveredReviewSpeech } from '@/lib/pbl/v3/narration';
 import { beforeAll, afterAll, describe, expect, it, vi, onTestFinished } from 'vitest';
 import { randomUUID } from 'node:crypto';
 import { DECISION_RESPONSE_MAX_LENGTH } from '@/lib/pbl/v3/domain/orchestration/decisions';
@@ -63,6 +64,7 @@ const mocked = vi.hoisted(() => ({
 vi.mock('@/lib/persistence/server-provider', () => ({
   getServerPersistenceProvider: async () => ({
     pool: mocked.pool,
+    runtimeStore: { listSessions: async () => [], getSession: async () => undefined },
     assetStore: new PgAssetStore(mocked.pool as Pool, {
       withTransaction: async (fn) => {
         const db = await (mocked.pool as Pool).connect();
@@ -377,6 +379,7 @@ import { pblArchiveFailureGraceMs, pblIdleTimeoutMs } from '@/lib/server/pbl-v3/
 import {
   commandStudy,
   openStudy,
+  resetStudy,
   learningView,
   digest,
   filesFingerprint,
@@ -1075,15 +1078,22 @@ describe.skipIf(!url)('PBL v3 teaching runtime with real PG', () => {
     }
   });
 
-  it.each([false, true])(
-    'persists literal text decisions through summaries and reports (option collision: %s)',
-    async (collision) => {
+  it.each([
+    {
+      collision: false,
+      labels: { responseLabel: 'What should the rule do?', rationaleLabel: 'Why this rule?' },
+    },
+    { collision: true, labels: {} },
+  ])(
+    'persists literal text decisions through summaries and reports (option collision: $collision)',
+    async ({ collision, labels }) => {
       const bundle = packageBuiltin(project);
       const descriptor: ProjectDescriptor = JSON.parse(bundle.files['project.json']);
       descriptor.id = descriptor.definition.id = `open-response-${randomUUID()}`;
       const decision = descriptor.definition.decisions[0]!;
       decision.responseType = 'text';
       decision.requiresRationale = true;
+      Object.assign(decision, labels);
       if (!collision) decision.options = [];
       bundle.files['project.json'] = JSON.stringify(descriptor);
       const ref = await installProjectPackage(
@@ -1198,10 +1208,15 @@ describe.skipIf(!url)('PBL v3 teaching runtime with real PG', () => {
           )
         ).rows[0].n,
       ).toBe(1);
-      const view = await learningView(principal, row.id);
-      expect(view.decisions[0]).toMatchObject({
+      const reopened = await openStudy(principal, stageId, 'response');
+      expect(reopened.id).toBe(row.id);
+      const view = await learningView(principal, reopened.id);
+      expect(view.decisions[0]).toEqual({
+        id: decision.id,
+        prompt: decision.decisionPrompt,
         responseType: 'text',
         requiresRationale: true,
+        ...labels,
         options: decision.options.map(({ id, label }) => ({ id, label })),
       });
       await send('decide', {
@@ -1924,7 +1939,24 @@ describe.skipIf(!url)('PBL v3 teaching runtime with real PG', () => {
       }),
     ).rejects.toThrow('Use response');
     expect((await store.binding(opening.sessionId))?.guided?.pending).toBeUndefined();
-    const result = await tool.execute(randomUUID(), { response });
+    const draft = 'Shall we start with the project background?';
+    const callId = randomUUID();
+    await agents.appendControlEvent(opening.sessionId, {
+      ts: Date.now(),
+      type: 'message_end',
+      data: {
+        message: {
+          role: 'assistant',
+          stopReason: 'toolUse',
+          timestamp: Date.now(),
+          content: [
+            { type: 'text', text: draft },
+            { type: 'toolCall', name: tool.name, id: callId, arguments: { response } },
+          ],
+        },
+      },
+    });
+    const result = await tool.execute(callId, { response });
     expect(JSON.stringify(result)).toContain('canonical');
     const guided = (await store.binding(opening.sessionId))!.guided!;
     expect(guided.pending).toMatchObject({ question: `**${closing}**`, displayText: response });
@@ -1939,6 +1971,7 @@ describe.skipIf(!url)('PBL v3 teaching runtime with real PG', () => {
       .flatMap((part) => (part.kind === 'text' ? [part.text] : []))
       .join('\n');
     expect(text.split(closing)).toHaveLength(2);
+    expect(text).not.toContain(draft);
     expect(text).not.toContain('还有背景问题吗？');
     expect(view.actions).not.toContain('next');
     expect(view.state.position.stageIndex).toBe(0);
@@ -2147,6 +2180,49 @@ describe.skipIf(!url)('PBL v3 teaching runtime with real PG', () => {
       expectedAttempt: meta!.attempt,
     });
   });
+  it('keeps earlier replies in history while marking only the active step for the companion', async () => {
+    const study = await freshStudy();
+    onTestFinished(() => releasePreparationFixtures([study.id]));
+    const previous: string[] = [];
+    const currentWords = async () => {
+      const entries =
+        (await learningView(principal, study.id, { passive: true })).conversation ?? [];
+      const words = (entry: (typeof entries)[number]) =>
+        entry.parts.flatMap((part) => (part.kind === 'text' ? [part.text] : []));
+      expect(entries.flatMap(words)).toEqual(expect.arrayContaining(previous));
+      return entries.filter((entry) => entry.currentStage).flatMap(words);
+    };
+    // The implementation is by the coder; both the quiz and recap belong to the mentor.
+    for (const index of [3, 5, 6]) {
+      const row = await store.get(study.id, principal.ownerId);
+      row.state.position.stageIndex = index;
+      row.state.milestones[0]!.stageIndex = index;
+      await store.transaction((db) => store.commit(db, row, { state: row.state, events: [] }));
+      expect(await currentWords()).toEqual([]);
+      const { sessionId } = (await study.send('begin')) as { sessionId: string };
+      expect(await currentWords()).toEqual([]);
+      const worker = 'companion-worker';
+      const claim = await agents.claimNextSession(worker, process.pid, {
+        sessionId,
+        leaseTtlMs: 10000,
+        maxAttempts: 5,
+      });
+      const text = 'Instructions for step ' + index;
+      await agents.appendRunEvent(sessionId, worker, {
+        ts: Date.now(),
+        attempt: claim!.attempt,
+        type: 'message_end',
+        data: { message: { role: 'assistant', content: [{ type: 'text', text }] } },
+      });
+      await agents.finishSession(sessionId, worker, {
+        status: 'succeeded',
+        expectedAttempt: claim!.attempt,
+      });
+      expect(await currentWords()).toEqual([text]);
+      previous.push(text);
+    }
+  });
+
   it('opens each stage once without fabricating student feedback', async () => {
     const study = await freshStudy();
     const original = await store.get(study.id, principal.ownerId);
@@ -3478,9 +3554,12 @@ describe.skipIf(!url)('PBL v3 teaching runtime with real PG', () => {
         cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
       },
     };
+    const request = 'Which file should I open? How do I test it?';
+    const partial = 'Open greeting.py.';
     const raw: import('@earendil-works/pi-ai').Message[] = [
       { role: 'user', content: 'Historical learning evidence. '.repeat(6000), timestamp: 0 },
-      { role: 'user', content: 'Please explain the current work.', timestamp: 1 },
+      { role: 'user', content: request, timestamp: 1 },
+      { ...summaryMessage, content: [{ type: 'text', text: partial }], timestamp: 2 },
     ];
     for (const message of raw) await session.appendMessage(message);
     const before = (await store.get(study.id, principal.ownerId)).state;
@@ -3511,10 +3590,14 @@ describe.skipIf(!url)('PBL v3 teaching runtime with real PG', () => {
       contextWindow: 32000,
       maxTokens: 4096,
     } as import('@earendil-works/pi-ai').Model<import('@earendil-works/pi-ai').Api>;
-    await projection.prepare(
+    const fresh = await projection.prepare(
       { systemPrompt: 'Current host state is incomplete.', messages: raw },
-      config.historyWindow,
+      { ...config.historyWindow, spokenReview: true, recoverySpeech: [partial] },
       model,
+    );
+    expect(requestStateTail(fresh)).toContain('Original learner input: ' + JSON.stringify(request));
+    expect(requestStateTail(fresh)).toContain(
+      'Already delivered to the learner: ' + JSON.stringify(partial),
     );
     projection.dispose();
     const history = await loadSessionEntryHistory(session, {
@@ -3546,7 +3629,7 @@ describe.skipIf(!url)('PBL v3 teaching runtime with real PG', () => {
         attempt: second!.attempt,
       }),
     );
-    const next = { role: 'user' as const, content: 'Do not change my current plan.', timestamp: 2 };
+    const next = { role: 'user' as const, content: 'Do not change my current plan.', timestamp: 3 };
     await restored.appendMessage(next);
     const forbidden = vi.fn(() => {
       throw new Error('Old history must not be summarized again');
@@ -3695,6 +3778,84 @@ describe.skipIf(!url)('PBL v3 teaching runtime with real PG', () => {
       expect(await agents.listUserMessages(sessionId)).toEqual(input);
       await expireStalledTeachingTurns();
       expect((await agents.getSession(sessionId))!.status).toBe('queued');
+    },
+  );
+
+  it.each([
+    { stageIndex: 0, mode: 'teaching', offersReplies: true },
+    { stageIndex: 1, mode: 'decision', offersReplies: true },
+    { stageIndex: 3, mode: 'code', offersReplies: true },
+    { stageIndex: 3, mode: 'classic', offersReplies: false },
+    { stageIndex: 4, mode: 'tests', offersReplies: false },
+    { stageIndex: 4, mode: 'repair', offersReplies: true },
+    { stageIndex: 5, mode: 'quiz', offersReplies: false },
+  ])(
+    'offers replies only for available learner chat and preserves the $mode handoff',
+    async ({ stageIndex, mode, offersReplies }) => {
+      const study = await freshStudy();
+      const row = await store.get(study.id, principal.ownerId);
+      const previous = process.env.OPENMAIC_PBL_V3_WHITEBOARD;
+      process.env.OPENMAIC_PBL_V3_WHITEBOARD = String(mode !== 'classic');
+      onTestFinished(async () => {
+        if (previous === undefined) delete process.env.OPENMAIC_PBL_V3_WHITEBOARD;
+        else process.env.OPENMAIC_PBL_V3_WHITEBOARD = previous;
+        await pool.query("UPDATE sandbox_environments SET state='destroyed' WHERE id=$1", [
+          row.environment_id,
+        ]);
+      });
+      row.state.position.stageIndex = stageIndex;
+      row.state.milestones[0]!.stageIndex = stageIndex;
+      if (mode === 'repair') {
+        row.state.collected.greeting!.remediation = {
+          id: randomUUID(),
+          kind: 'implementation_repair',
+          target: 'coder',
+          reason: 'tests',
+          attempt: 1,
+          evaluationId: randomUUID(),
+        };
+      }
+      await store.transaction((db) => store.commit(db, row, { state: row.state, events: [] }));
+      const { sessionId } = (await study.send('begin')) as { sessionId: string };
+      const workerId = 'suggest-replies';
+      const claim = await agents.claimNextSession(workerId, process.pid, {
+        sessionId,
+        leaseTtlMs: 10000,
+        maxAttempts: 5,
+      });
+      const config = await teachingRunnerConfig({
+        sessionId,
+        ownerId: principal.ownerId,
+        workerId,
+        attempt: claim!.attempt,
+        signal: new AbortController().signal,
+      });
+      const cue = config.tools.find((tool) => tool.name === 'cue_user');
+      expect(!!cue).toBe(offersReplies);
+      if (cue) {
+        expect(cue.description).toContain("the learner's own reasoning or an assessment answer");
+        const options = ['Explain the first option', 'Explain the second option'];
+        const result = await invoke(config, 'cue_user', { options });
+        const value = JSON.parse((result.content[0] as { text: string }).text);
+        expect(value.options).toEqual(options);
+        if (mode === 'decision') expect(value.guidance).toContain('add only that detail');
+        else expect(value.guidance).toBeUndefined();
+      }
+      if (stageIndex === 3) {
+        for (const [name, field] of [
+          ['respond_to_learner', 'response'],
+          ['request_learner_help', 'question'],
+        ]) {
+          const handoff = config.tools.find((tool) => tool.name === name)!;
+          expect(handoff.parameters).toHaveProperty(
+            'properties',
+            mode === 'classic' ? { [field]: expect.objectContaining({ type: 'string' }) } : {},
+          );
+        }
+      }
+      expect(config.isTurnComplete()).toBe(false);
+      expect((await store.get(study.id, principal.ownerId)).state).toEqual(row.state);
+      await agents.releaseLease(sessionId, workerId);
     },
   );
 
@@ -5155,6 +5316,455 @@ describe.skipIf(!url)('PBL v3 teaching runtime with real PG', () => {
     });
   });
 
+  it.each([
+    'spoken',
+    'closing the board',
+    'separate board action',
+    'tool-only',
+    'continuation',
+    'restated',
+    'new question',
+    'takeover',
+    'takeover with a missing question',
+    'takeover with an extra hint',
+    'takeover with a hint but no tool',
+    'takeover after delivering the hint',
+    'takeover after two old stops with the question first',
+    'takeover after two old stops with the question last',
+    'missing closing',
+    'missing closing without intent',
+    'unconfirmed closing',
+  ] as const)('registers one board review from %s delivery', async (mode) => {
+    const previous = process.env.OPENMAIC_PBL_V3_WHITEBOARD;
+    process.env.OPENMAIC_PBL_V3_WHITEBOARD = 'true';
+    try {
+      const study = await freshStudy();
+      const { sessionId } = (await study.send('begin')) as { sessionId: string };
+      const worker = startAgentRunner();
+      await worker.stop();
+      let claim = await agents.claimNextSession(worker.workerId, process.pid, {
+        sessionId,
+        leaseTtlMs: 10000,
+        maxAttempts: 5,
+      });
+      const question = '请说说你会先核对哪一步。';
+      const speech = 'The project connects a question to a reply.\n\n' + question;
+      const summary = 'Look at the highlighted return value.';
+      const receipt = {
+        type: 'tool-call',
+        toolName: 'request_skill_review',
+        toolCallId: 'record-review',
+        input: mode === 'tool-only' ? { question } : { question: '你准备先检查哪个步骤？' },
+      };
+      const register = { ...receipt, toolCallId: 'register-spoken', input: {} };
+      const callOnly = (call: typeof register) => [call, modelFinish('tool-calls')];
+      const speakAndCall = (text: string, call: typeof register) => [
+        { type: 'text-delta', text },
+        ...callOnly(call),
+      ];
+      const starting = (await store.get(study.id, principal.ownerId)).state.position;
+      const inputs = await agents.listUserMessages(sessionId);
+      const takeover = mode.startsWith('takeover');
+      const oldPair = mode.startsWith('takeover after two old stops');
+      const questionLast = mode === 'takeover after two old stops with the question last';
+      if (takeover) {
+        // The interrupted reply can end either with a question or with just its introduction.
+        const input = inputs.at(-1)!;
+        const session = new Session(
+          await AgentSessionEntryStorage.open({
+            sessionId,
+            workerId: worker.workerId,
+            attempt: claim!.attempt,
+          }),
+        );
+        await session.appendMessage(
+          tagDurableUserMessage(
+            {
+              role: 'user',
+              content: input.text,
+              timestamp: Date.now(),
+            },
+            input.seq,
+          ),
+        );
+        const delivered: import('@earendil-works/pi-ai').AssistantMessage = {
+          role: 'assistant',
+          content: [
+            {
+              type: 'text',
+              text: mode === 'takeover with a missing question' || questionLast ? summary : speech,
+            },
+          ],
+          stopReason: 'stop',
+          api: 'openai-completions',
+          provider: 'openai',
+          model: 'test-model',
+          timestamp: Date.now(),
+          usage: {
+            input: 0,
+            output: 0,
+            cacheRead: 0,
+            cacheWrite: 0,
+            totalTokens: 0,
+            cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+          },
+        };
+        await session.appendMessage(delivered);
+        await agents.appendRunEvent(sessionId, worker.workerId, {
+          ts: delivered.timestamp,
+          type: 'message_end',
+          attempt: claim!.attempt,
+          data: { message: delivered },
+        });
+        if (oldPair) {
+          const second = {
+            ...delivered,
+            timestamp: delivered.timestamp + 1,
+            content: [{ type: 'text' as const, text: questionLast ? question : summary }],
+          };
+          await session.appendMessage(second);
+          await agents.appendRunEvent(sessionId, worker.workerId, {
+            ts: second.timestamp,
+            type: 'message_end',
+            attempt: claim!.attempt,
+            data: { message: second },
+          });
+        }
+        await agents.markUserMessageDelivered(
+          sessionId,
+          worker.workerId,
+          claim!.attempt,
+          input.seq,
+        );
+        const takeOver = async (from: string, to: string) => {
+          await agents.appendRunEvent(sessionId, from, {
+            ts: Date.now(),
+            attempt: claim!.attempt,
+            type: 'session_interrupted',
+            data: { reason: 'runner shutdown' },
+          });
+          await agents.releaseLease(sessionId, from);
+          return agents.claimNextSession(to, process.pid, {
+            sessionId,
+            leaseTtlMs: 10000,
+            maxAttempts: 5,
+          });
+        };
+        claim = await takeOver(worker.workerId, 'board-review-takeover');
+        if (mode === 'takeover after delivering the hint') {
+          // The previous worker durably spoke the hint, but lost its lease before running the tool.
+          const recoveredSession = new Session(
+            await AgentSessionEntryStorage.open({
+              sessionId,
+              workerId: 'board-review-takeover',
+              attempt: claim!.attempt,
+            }),
+          );
+          const hint = {
+            ...delivered,
+            timestamp: delivered.timestamp + 1,
+            stopReason: 'toolUse' as const,
+            pblRetainedReview: true,
+            pblReviewSourceAt: delivered.timestamp,
+            content: [
+              { type: 'text' as const, text: summary },
+              {
+                type: 'toolCall' as const,
+                name: 'request_skill_review',
+                id: 'orphaned-registration',
+                arguments: { reviewDelivery: 'add_hint' },
+              },
+            ],
+          };
+          await recoveredSession.appendMessage(hint);
+          await agents.appendRunEvent(sessionId, 'board-review-takeover', {
+            ts: hint.timestamp,
+            attempt: claim!.attempt,
+            type: 'message_end',
+            data: { message: hint },
+          });
+          claim = await takeOver('board-review-takeover', 'board-review-second-takeover');
+        }
+      }
+      switch (mode) {
+        case 'takeover':
+          mocked.responses = [
+            speakAndCall('你准备先检查哪个步骤？', register),
+            callOnly({ ...register, input: { reviewDelivery: 'keep_question' } }),
+          ];
+          break;
+        case 'takeover after two old stops with the question first':
+        case 'takeover after two old stops with the question last':
+          mocked.responses = [
+            callOnly({ ...register, input: { reviewDelivery: 'keep_question' } }),
+            callOnly({
+              ...register,
+              input: { reviewDelivery: 'keep_question', questionId: questionLast ? 2 : 1 },
+            }),
+          ];
+          break;
+        case 'takeover with a hint but no tool':
+          mocked.responses = [
+            textResponse(summary + ' ' + question),
+            callOnly({ ...register, input: { reviewDelivery: 'add_hint' } }),
+          ];
+          break;
+        case 'takeover with an extra hint':
+          mocked.responses = [
+            speakAndCall(summary + ' ' + question, register),
+            callOnly({ ...register, input: { reviewDelivery: 'add_hint' } }),
+          ];
+          break;
+        case 'takeover after delivering the hint':
+          mocked.responses = [callOnly(register)];
+          break;
+        case 'unconfirmed closing':
+          mocked.responses = [
+            textResponse(summary),
+            speakAndCall(question, register),
+            callOnly(register),
+          ];
+          break;
+        case 'takeover with a missing question':
+        case 'missing closing without intent':
+          mocked.responses = [
+            ...(takeover ? [] : [textResponse(summary)]),
+            [
+              { type: 'text-delta', text: summary + '\n\n' + question },
+              { ...register, toolName: 'wb_close', toolCallId: 'close-board' },
+              ...callOnly(register),
+            ],
+            // The author selects the exact buffered question without generating it again.
+            callOnly({ ...register, input: { reviewDelivery: 'ask_question' } }),
+          ];
+          break;
+        case 'missing closing':
+          mocked.responses = [
+            textResponse(summary),
+            speakAndCall(question, { ...register, input: { askNewQuestion: true } }),
+          ];
+          break;
+        case 'tool-only':
+          mocked.responses = [callOnly(receipt)];
+          break;
+        case 'continuation':
+          mocked.responses = [textResponse(speech), callOnly(receipt)];
+          break;
+        case 'closing the board':
+          mocked.responses = [
+            speakAndCall(speech, { ...register, toolName: 'wb_close', toolCallId: 'close-board' }),
+            callOnly(register),
+          ];
+          break;
+        case 'separate board action':
+          mocked.responses = [
+            speakAndCall(speech, {
+              ...register,
+              toolName: 'cue_user',
+              toolCallId: 'replies',
+              input: { options: ['Ready', 'Explain again'] },
+            }),
+            callOnly({ ...register, toolName: 'wb_open', toolCallId: 'show-board' }),
+            callOnly(register),
+          ];
+          break;
+        case 'restated':
+          mocked.responses = [speakAndCall(speech, receipt), callOnly(register)];
+          break;
+        case 'new question':
+          mocked.responses = [speakAndCall(summary, receipt), speakAndCall(question, register)];
+          break;
+        case 'spoken':
+          mocked.responses = [speakAndCall(speech, register)];
+          break;
+      }
+      const callsBefore = mocked.modelCalls;
+      await runSession(
+        { running: new Map(), shuttingDown: false },
+        {
+          ...claim!,
+          ...(await agents.getSession(sessionId))!,
+        },
+      );
+      const session = await agents.getSession(sessionId);
+      if (mode === 'unconfirmed closing') {
+        expect(mocked.modelCalls - callsBefore).toBe(3);
+        expect(session?.status).toBe('failed');
+        expect((await store.binding(sessionId))?.guided?.pending).toBeUndefined();
+        expect((await store.get(study.id, principal.ownerId)).state.position).toEqual(starting);
+        expect(await agents.listUserMessages(sessionId)).toEqual(inputs);
+        const failed = await learningView(principal, study.id, { passive: true });
+        expect(failed.roleRun?.canRetry).toBe(true);
+        expect(failed.actions).not.toContain('next');
+        expect(
+          failed
+            .conversation!.flatMap((entry) => entry.parts)
+            .flatMap((p) => (p.kind === 'text' ? [p.text] : [])),
+        ).toEqual([summary]);
+        return;
+      }
+      expect(session?.status, session?.error ?? undefined).toBe('succeeded');
+      expect((await store.binding(sessionId))?.guided?.pending?.question).toBe(question);
+      const committed = (await store.binding(sessionId))!.guided!;
+      if (mode !== 'tool-only') expect(committed.pending?.spokenAt).toEqual(expect.any(Number));
+      expect(committed.approval).toBeUndefined();
+      expect(await agents.listUserMessages(sessionId)).toEqual(inputs);
+      expect((await store.get(study.id, principal.ownerId)).state.position).toEqual(starting);
+      const view = await learningView(principal, study.id, { passive: true });
+      expect(view.actions).not.toContain('next');
+      const refreshed = await learningView(principal, study.id, { passive: true });
+      expect(refreshed.conversation).toEqual(view.conversation);
+      if (mode === 'takeover')
+        expect(recoveredReviewSpeech(refreshed.conversation!.at(-1))?.text).toBe(question);
+      const parts = view.conversation!.flatMap((entry) => entry.parts);
+      const deliveredHint =
+        mode === 'takeover with an extra hint' ||
+        mode === 'takeover after delivering the hint' ||
+        mode === 'takeover with a hint but no tool';
+      if (deliveredHint) {
+        const original = parts.find((p) => p.kind === 'text' && p.text === speech);
+        expect(original).toMatchObject({ spokenAt: committed.pending?.spokenAt });
+        const hint = parts.find((p) => p.kind === 'text' && p.text === summary);
+        expect(hint).toMatchObject({ supplementsReview: committed.pending?.spokenAt });
+        const replay = view.conversation!.flatMap((entry) => narrationSteps(entry));
+        const spoken = replay.flatMap((step) => (step.kind === 'say' ? [step.text] : []));
+        expect(spoken.join(' ')).toContain(summary);
+        expect(spoken.join(' ').split(question)).toHaveLength(2);
+        expect(recoveredReviewSpeech(refreshed.conversation!.at(-1))?.text).toBe(
+          summary + '\n\n' + question,
+        );
+      }
+      expect(parts.filter((p) => p.kind === 'text').map((p) => p.text)).toEqual(
+        deliveredHint || (oldPair && !questionLast)
+          ? [speech, summary]
+          : [
+                'new question',
+                'missing closing',
+                'missing closing without intent',
+                'takeover with a missing question',
+                'takeover after two old stops with the question last',
+              ].includes(mode)
+            ? [summary, question]
+            : [mode === 'tool-only' ? question : speech],
+      );
+      expect(
+        parts.filter(
+          (p) => p.kind === 'tool' && p.name === 'request_skill_review' && p.status === 'succeeded',
+        ),
+      ).toHaveLength(1);
+    } finally {
+      if (previous === undefined) delete process.env.OPENMAIC_PBL_V3_WHITEBOARD;
+      else process.env.OPENMAIC_PBL_V3_WHITEBOARD = previous;
+    }
+  });
+  it.each([
+    ['request_skill_review', 'write_file', false],
+    ['respond_to_learner', 'read_file', false],
+    ['request_learner_help', 'read_file', false],
+    ['respond_to_learner', 'read_file', true],
+    ['request_skill_review', 'read_file', 'hint'],
+  ] as const)(
+    'registers %s alongside %s in the same SDK reply (replayed: %s)',
+    async (handoff, fileTool, replayed) => {
+      const stage = project.definition.milestones[0]!.stages[3]!;
+      if (stage.kind !== 'produce') throw new Error('Expected code stage');
+      const previousBuild = stage.compileBeforeReview;
+      const previousBoard = process.env.OPENMAIC_PBL_V3_WHITEBOARD;
+      stage.compileBeforeReview = handoff === 'request_learner_help';
+      onTestFinished(() => {
+        stage.compileBeforeReview = previousBuild;
+        if (previousBoard === undefined) delete process.env.OPENMAIC_PBL_V3_WHITEBOARD;
+        else process.env.OPENMAIC_PBL_V3_WHITEBOARD = previousBoard;
+      });
+      const study = await freshStudy();
+      onTestFinished(() => releasePreparationFixtures([study.id]));
+      const row = await store.get(study.id, principal.ownerId);
+      row.state.position.stageIndex = 3;
+      row.state.milestones[0]!.stageIndex = 3;
+      await store.transaction((db) => store.commit(db, row, { state: row.state, events: [] }));
+      const { sessionId } = (await study.send('chat')) as { sessionId: string };
+      const worker = startAgentRunner();
+      await worker.stop();
+      const claim = () =>
+        agents.claimNextSession(worker.workerId, process.pid, {
+          sessionId,
+          leaseTtlMs: 10000,
+          maxAttempts: 5,
+        });
+      const run = async () => {
+        const lease = await claim();
+        await runSession(
+          { running: new Map(), shuttingDown: false },
+          { ...lease!, ...(await agents.getSession(sessionId))! },
+        );
+        expect((await agents.getSession(sessionId))?.status).toBe('succeeded');
+      };
+      const original = 'Which function returns the greeting?';
+      if (handoff === 'respond_to_learner') {
+        process.env.OPENMAIC_PBL_V3_WHITEBOARD = 'false';
+        mocked.responses = [
+          toolResponse([{ name: 'read_next_skill', input: {} }]),
+          toolResponse([{ name: 'request_skill_review', input: { question: original } }]),
+        ];
+        await run();
+        await study.send('chat');
+      }
+      process.env.OPENMAIC_PBL_V3_WHITEBOARD = 'true';
+      const path = 'greeting.py';
+      const service = await SandboxService.forOwner(principal);
+      const before = await service.readText(row.environment_id!, path);
+      const text = before + '\n# new implementation detail\n';
+      const words =
+        handoff === 'request_learner_help'
+          ? 'Which build requirement should we check?'
+          : handoff === 'respond_to_learner' || replayed === 'hint'
+            ? 'Open greeting.py to see its return value.'
+            : 'Which line returns the greeting?';
+      mocked.responses = [
+        ...(handoff === 'respond_to_learner'
+          ? []
+          : [toolResponse([{ name: 'read_next_skill', input: {} }])]),
+        ...(replayed ? [textResponse(replayed === 'hint' ? original : words)] : []),
+        [
+          { type: 'text-delta', text: words },
+          ...toolResponse([
+            {
+              name: fileTool,
+              input:
+                fileTool === 'read_file' ? { path } : { path, text, expectedHash: digest(before) },
+            },
+            { name: handoff, input: replayed === 'hint' ? { reviewDelivery: 'add_hint' } : {} },
+          ]),
+        ],
+      ];
+      const expectedCalls = mocked.responses.length;
+      const calls = mocked.modelCalls;
+      await run();
+      expect(mocked.modelCalls - calls).toBe(expectedCalls);
+      const view = await learningView(principal, study.id, { passive: true });
+      const parts = view.conversation!.flatMap((entry) => entry.parts);
+      for (const name of [fileTool, handoff])
+        expect(parts).toContainEqual(
+          expect.objectContaining({ kind: 'tool', name, status: 'succeeded' }),
+        );
+      expect(parts.filter((part) => part.kind === 'text' && part.text === words)).toHaveLength(1);
+      const guided = (await store.binding(sessionId))!.guided!;
+      expect(handoff === 'request_skill_review' ? guided.pending : guided.handoff).toMatchObject({
+        question: replayed === 'hint' ? original : words,
+        spokenAt: expect.any(Number),
+      });
+      if (replayed === 'hint')
+        expect(parts.find((p) => p.kind === 'text' && p.text === original)).toMatchObject({
+          spokenAt: guided.pending?.spokenAt,
+        });
+      if (handoff === 'respond_to_learner') expect(guided.pending?.question).toBe(original);
+      if (fileTool === 'write_file')
+        expect(await service.readText(row.environment_id!, path)).toBe(text);
+      expect(guided.approval).toBeUndefined();
+      expect(view.state.position).toEqual(row.state.position);
+      expect(view.actions).not.toContain('next');
+    },
+  );
   it('rejects feedback for an unopened section instead of silently reopening the first lesson', async () => {
     const study = await freshStudy(),
       opening = (await study.send('begin')) as { sessionId: string };
@@ -5824,9 +6434,24 @@ describe.skipIf(!url)('PBL v3 teaching runtime with real PG', () => {
       expect(view.state.position.stageIndex).toBe(0);
     },
   );
-  it.each([false, true])(
-    'repairs a prose-only assistance reply without replacing readiness or duplicating its answer (crash: %s)',
-    async (crash) => {
+  it.each([
+    { crash: false, board: false, delivery: 'register' },
+    { crash: true, board: false, delivery: 'register' },
+    { crash: false, board: true, delivery: 'register' },
+    { crash: true, board: true, delivery: 'register' },
+    { crash: true, board: true, delivery: 'tool carries missing detail' },
+    { crash: false, board: true, delivery: 'unmarked missing detail' },
+    { crash: false, board: true, delivery: 'missing detail' },
+    { crash: false, board: true, delivery: 'board before receipt' },
+    { crash: false, board: true, delivery: 'mixed missing detail' },
+    { crash: true, board: true, delivery: 'board then mixed missing detail' },
+    { crash: false, board: true, delivery: 'replay across board with missing detail' },
+    { crash: false, board: true, delivery: 'language preference' },
+    { crash: false, board: true, delivery: 'legacy full response' },
+    { crash: false, board: true, delivery: 'already delivered clarification' },
+  ] as const)(
+    'preserves assistance and pending readiness ($delivery, crash: $crash, board: $board)',
+    async ({ crash, board, delivery }) => {
       const study = await freshStudy();
       const row = await store.get(study.id, principal.ownerId);
       onTestFinished(async () => {
@@ -5855,6 +6480,14 @@ describe.skipIf(!url)('PBL v3 teaching runtime with real PG', () => {
         status: 'succeeded',
         expectedAttempt: first!.attempt,
       });
+      if (board) {
+        const previous = process.env.OPENMAIC_PBL_V3_WHITEBOARD;
+        process.env.OPENMAIC_PBL_V3_WHITEBOARD = 'true';
+        onTestFinished(() => {
+          if (previous === undefined) delete process.env.OPENMAIC_PBL_V3_WHITEBOARD;
+          else process.env.OPENMAIC_PBL_V3_WHITEBOARD = previous;
+        });
+      }
       const chatCommandId = randomUUID();
       await commandStudy(principal, study.id, {
         id: chatCommandId,
@@ -5879,7 +6512,9 @@ describe.skipIf(!url)('PBL v3 teaching runtime with real PG', () => {
         claimed!.attempt,
         inputs.at(-2)!.seq,
       );
-      const response = 'Use Project files in the IDE. Allowed edits save automatically.';
+      const opening = 'Use Project files in the IDE.';
+      const closing = 'Allowed edits save automatically.';
+      const response = opening + '\n\n' + closing;
       let originalTextId: string | undefined;
       if (crash) {
         const session = new Session(
@@ -5954,28 +6589,126 @@ describe.skipIf(!url)('PBL v3 teaching runtime with real PG', () => {
             type: 'trace',
             data: { message: 'Awaiting recovery' },
           });
-        await agents.releaseLease(sessionId, handle.workerId);
+        // Exercise a new attempt in board mode, and a graceful same-attempt resume without it.
+        const attempt = claimed!.attempt;
+        if (board) {
+          await pool.query('UPDATE agent_sessions SET lease_heartbeat_at=0 WHERE id=$1', [
+            sessionId,
+          ]);
+          await maintainStudy(store, study.id, principal.ownerId);
+        } else await agents.releaseLease(sessionId, handle.workerId);
         claimed = await agents.claimNextSession('assistance-takeover', process.pid, {
           sessionId,
           leaseTtlMs: 10000,
           maxAttempts: 5,
         });
+        if (board) expect(claimed).toMatchObject({ claimReason: 'orphaned', attempt: attempt + 1 });
       }
-      mocked.responses = [
-        ...(crash ? [] : [textResponse(response)]),
-        toolResponse([{ name: 'respond_to_learner', input: { response } }]),
+      const lastDetail = 'Open the second file to see the actual return value.';
+      const missing = delivery.endsWith('missing detail');
+      const answer = { name: 'respond_to_learner', input: board ? {} : { response } };
+      const speak = (text: string, calls: Parameters<typeof toolResponse>[0]) => [
+        { type: 'text-delta', text },
+        ...toolResponse(calls),
       ];
+      mocked.responses = crash ? [] : [textResponse(response)];
+      switch (delivery) {
+        case 'register':
+          mocked.responses.push(board ? speak(response, [answer]) : toolResponse([answer]));
+          break;
+        case 'unmarked missing detail':
+          mocked.responses.push(speak(response + ' ' + lastDetail, [answer]));
+          break;
+        case 'tool carries missing detail':
+          mocked.responses.push(
+            toolResponse([{ ...answer, input: { remainingSpeech: lastDetail } }]),
+          );
+          break;
+        case 'missing detail':
+        case 'mixed missing detail':
+        case 'board then mixed missing detail':
+          if (delivery === 'board then mixed missing detail')
+            mocked.responses.push(speak(response, [{ name: 'wb_open', input: {} }]));
+          mocked.responses.push(
+            speak(lastDetail, [
+              { ...answer, input: { deliverMissing: true } },
+              ...(delivery === 'missing detail'
+                ? []
+                : [{ name: 'request_learner_help', input: {} }]),
+            ]),
+          );
+          break;
+        case 'board before receipt':
+          mocked.responses.push(
+            speak(response, [{ name: 'wb_open', input: {} }]),
+            toolResponse([answer]),
+          );
+          break;
+        case 'replay across board with missing detail':
+          mocked.responses = [
+            speak(opening, [{ name: 'wb_open', input: {} }]),
+            textResponse(closing),
+            speak(response, [{ name: 'wb_close', input: {} }]),
+            speak(closing + ' ' + lastDetail, [{ ...answer, input: { deliverMissing: true } }]),
+          ];
+          break;
+        case 'language preference':
+          mocked.responses = [
+            speak(response, [
+              { name: 'set_response_language', input: { locale: 'en-US', source: 'conversation' } },
+              answer,
+            ]),
+          ];
+          break;
+        case 'legacy full response':
+          mocked.responses.push(toolResponse([{ ...answer, input: { response } }]));
+          break;
+        case 'already delivered clarification':
+          mocked.responses.push(speak(response, [{ ...answer, input: { deliverMissing: true } }]));
+          break;
+      }
+      const expectedCalls = mocked.responses.length;
       const calls = mocked.modelCalls;
       await runSession(
         { running: new Map(), shuttingDown: false },
         { ...claimed!, ...(await agents.getSession(sessionId))! },
       );
-      expect(mocked.modelCalls - calls).toBe(crash ? 1 : 2);
+      expect(mocked.modelCalls - calls).toBe(expectedCalls);
       expect((await agents.getSession(sessionId))!.status).toBe('succeeded');
       expect((await store.binding(sessionId))!.guided!.pending).toEqual(pending);
-      expect(requestHostState(mocked.modelRequests.at(-1)!)).toContain(
-        'For an assistance-only answer or product clarification',
-      );
+      if (delivery === 'register')
+        expect(requestHostState(mocked.modelRequests.at(-1)!)).toContain(
+          board
+            ? 'Original learner input:'
+            : 'For an assistance-only answer or product clarification',
+        );
+      function expectDelivery(fragments: string[]) {
+        const words = fragments.join('\n\n');
+        for (const paragraph of [opening, closing]) expect(words.split(paragraph)).toHaveLength(2);
+        expect(words.split(lastDetail)).toHaveLength(missing ? 2 : 1);
+      }
+      if (board) {
+        const restored = await learningView(principal, study.id, { passive: true });
+        const tutorEntries = restored.conversation!.filter(
+          (entry) => entry.speaker !== 'user' && !entry.boundary,
+        );
+        const spoken = tutorEntries
+          .flatMap((entry) => narrationSteps(entry))
+          .flatMap((step) => (step.kind === 'say' ? [step.text] : []));
+        expectDelivery(spoken);
+        expect(tutorEntries.flatMap((entry) => entry.parts)).toContainEqual(
+          expect.objectContaining({
+            kind: 'tool',
+            name: 'respond_to_learner',
+            status: 'succeeded',
+          }),
+        );
+        if (crash && !missing) {
+          const latest = tutorEntries.at(-1)!;
+          expect(recoveredReviewSpeech(latest)?.text).toBe(response);
+          expect(narrationSteps(latest).some((step) => step.kind === 'say')).toBe(false);
+        }
+      }
       if (crash)
         await agents.appendControlEvent(sessionId, {
           ts: Date.now(),
@@ -5983,19 +6716,19 @@ describe.skipIf(!url)('PBL v3 teaching runtime with real PG', () => {
           data: { text: 'Thanks, I can see the files now.' },
         });
       const view = await learningView(principal, study.id, { passive: true });
-      expect(
+      expectDelivery(
         view
-          .conversation!.flatMap((entry) => entry.parts)
-          .filter((part) => part.kind === 'text' && part.text === response),
-      ).toHaveLength(1);
-      expect(
-        view.messages.filter((m) => m.role === 'assistant' && m.text === response),
-      ).toHaveLength(1);
-      expect(
+          .conversation!.filter((entry) => entry.speaker !== 'user')
+          .flatMap((entry) => entry.parts)
+          .flatMap((part) => (part.kind === 'text' ? [part.text] : [])),
+      );
+      expectDelivery(view.messages.filter((m) => m.role === 'assistant').map((m) => m.text));
+      expectDelivery(
         (await learningEvidence(principal, study.id)).conversations
           .flatMap((c) => c.messages)
-          .filter((m) => m.role === 'assistant' && m.text === response),
-      ).toHaveLength(1);
+          .filter((m) => m.role === 'assistant')
+          .map((m) => m.text),
+      );
       if (crash) {
         expect(
           view
@@ -8158,6 +8891,13 @@ describe.skipIf(!url)('PBL v3 teaching runtime with real PG', () => {
       });
       for (const milestone of descriptor.definition.milestones)
         descriptor.runtime.evaluations[milestone.id] = 'tests/private.json';
+      const replacementDescriptor = JSON.stringify(descriptor);
+      const mentorVoice = { providerId: 'custom-tts-studio', voiceId: 'guide' };
+      const coderVoice = { ...mentorVoice, voiceId: 'builder' };
+      if (!java) {
+        descriptor.definition.agents.mentor.voiceConfig = mentorVoice;
+        descriptor.definition.agents.coder.voiceConfig = coderVoice;
+      }
       bundle.files['project.json'] = JSON.stringify(descriptor);
       const projectRef = await installProjectPackage(
         principal.ownerId,
@@ -8200,6 +8940,7 @@ describe.skipIf(!url)('PBL v3 teaching runtime with real PG', () => {
         principal.ownerId,
         indexProjectFiles(importedId, selected.ref.version, {
           ...bundle.files,
+          'project.json': replacementDescriptor,
           'docs/0.md': 'Replacement course introduction; existing learners must keep their pin.',
         }),
       );
@@ -8213,6 +8954,9 @@ describe.skipIf(!url)('PBL v3 teaching runtime with real PG', () => {
       expect(reopened.id).toBe(created.id);
       expect(reopened.project_reference).toEqual(projectRef);
       expect(reopened.project?.coursePackage?.descriptor.id).toBe(importedId);
+      expect((await learningView(principal, reopened.id, { passive: true })).roleVoices).toEqual(
+        java ? undefined : { mentor: mentorVoice, coder: coderVoice },
+      );
       await expect(
         openStudy({ ...principal, ownerId: 'foreign-owner' }, stageId, 'scene'),
       ).rejects.toMatchObject({ status: 404 });
@@ -12234,5 +12978,113 @@ describe.skipIf(!url)('PBL v3 teaching runtime with real PG', () => {
       stop.mockRestore();
       await releasePreparationFixtures([row.id]);
     }
+  });
+  function enableStudyReset() {
+    const previous = process.env.OPENMAIC_PBL_V3_PROGRESS_RESET;
+    process.env.OPENMAIC_PBL_V3_PROGRESS_RESET = 'true';
+    onTestFinished(() => {
+      if (previous === undefined) delete process.env.OPENMAIC_PBL_V3_PROGRESS_RESET;
+      else process.env.OPENMAIC_PBL_V3_PROGRESS_RESET = previous;
+    });
+  }
+
+  it('waits for an admitted preparation and releases its environment on reset', async () => {
+    enableStudyReset();
+    const study = await unpreparedStudy();
+    const startCreate = Promise.withResolvers<void>();
+    const allowCreate = Promise.withResolvers<void>();
+    const create = E2BCompatibleSandboxProvider.prototype.create;
+    const paused = vi
+      .spyOn(E2BCompatibleSandboxProvider.prototype, 'create')
+      .mockImplementationOnce(async function (this: E2BCompatibleSandboxProvider, ...args) {
+        startCreate.resolve();
+        await allowCreate.promise;
+        return create.apply(this, args);
+      });
+    onTestFinished(() => paused.mockRestore());
+    const prepare = study.send('prepare');
+    await startCreate.promise;
+    const admission = vi.spyOn(LearningStore.prototype, 'waitForExclusive');
+    onTestFinished(() => admission.mockRestore());
+    const reset = resetStudy(principal, study.id);
+    try {
+      await vi.waitFor(() =>
+        expect(admission).toHaveBeenCalledWith(study.id, expect.any(Function)),
+      );
+    } finally {
+      allowCreate.resolve();
+      await Promise.all([prepare, reset]);
+    }
+    const envs = await pool.query(
+      'SELECT state FROM sandbox_environments WHERE owner_id=$1 AND workspace_id=$2',
+      [principal.ownerId, learningWorkspaceId(study.id)],
+    );
+    expect(envs.rows).toEqual([{ state: 'destroyed' }]);
+    await expect(store.get(study.id, principal.ownerId)).rejects.toMatchObject({ status: 404 });
+  });
+
+  it('retires a reset study for every tab while preserving evidence and a fresh scene slot', async () => {
+    enableStudyReset();
+    const first = await freshStudy();
+    const row = await store.get(first.id, principal.ownerId);
+    const counts = async () =>
+      (await pool.query('SELECT count(*) FROM pbl_v3_events WHERE study_id=$1', [row.id])).rows[0]
+        .count;
+    const evidence = await counts();
+    await store.completeOnboarding(row.id, principal.ownerId);
+    process.env.OPENMAIC_PBL_V3_PROGRESS_RESET = 'false';
+    await expect(resetStudy(principal, row.id)).rejects.toMatchObject({ status: 404 });
+    process.env.OPENMAIC_PBL_V3_PROGRESS_RESET = 'true';
+    await expect(
+      resetStudy({ ...principal, ownerId: 'another-owner' }, row.id),
+    ).rejects.toMatchObject({ status: 404 });
+    // Simulate a provider error after retirement. Maintenance must still reclaim the resource.
+    vi.spyOn(SandboxService.prototype, 'destroy').mockRejectedValueOnce(
+      new Error('release deferred'),
+    );
+    try {
+      await expect(resetStudy(principal, row.id)).resolves.toEqual({ reset: true });
+    } finally {
+      vi.mocked(SandboxService.prototype.destroy).mockRestore();
+    }
+    const creates = mocked.creates.length;
+    for (const revision of [row.revision, row.revision + 1])
+      await expect(
+        commandStudy(principal, row.id, { type: 'prepare', id: randomUUID(), revision }),
+      ).rejects.toMatchObject({ status: 404 });
+    await expect(learningView(principal, row.id)).rejects.toMatchObject({ status: 404 });
+    await expect(workbenchView(principal, row.id)).rejects.toMatchObject({ status: 404 });
+    await expect(store.recordActivity(row.id, principal.ownerId)).rejects.toMatchObject({
+      status: 404,
+    });
+    await expect(store.completeOnboarding(row.id, principal.ownerId)).rejects.toMatchObject({
+      status: 404,
+    });
+    expect(mocked.creates).toHaveLength(creates);
+    await maintainStudy(store, row.id, principal.ownerId, row.environment_id!);
+    expect(
+      (await (await SandboxStore.open()).get(principal.ownerId, row.environment_id!))?.state,
+    ).toBe('destroyed');
+    expect(await counts()).toBe(evidence);
+    expect(await store.hasSeenOnboarding(principal.ownerId)).toBe(true);
+    const next = await store.create(
+      {
+        ownerId: principal.ownerId,
+        stageId: row.stage_id,
+        sceneId: row.scene_id,
+        projectId: project.ref.id,
+        version: project.ref.version,
+      },
+      startOrchestration(project.definition),
+    );
+    expect(next.id).not.toBe(row.id);
+    await commandStudy(principal, next.id, {
+      type: 'prepare',
+      id: randomUUID(),
+      revision: next.revision,
+    });
+    await expect(resetStudy(principal, row.id)).rejects.toMatchObject({ status: 404 });
+    expect((await store.get(next.id, principal.ownerId)).environment_id).toBeTruthy();
+    await releasePreparationFixtures([next.id]);
   });
 });

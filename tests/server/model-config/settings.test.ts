@@ -43,6 +43,68 @@ afterEach(() => {
   vi.unstubAllEnvs();
 });
 
+it('recovers stale workspace slots while adding a replacement provider', async () => {
+  const current: ModelConfigLayer['config'] = {
+    providers: { retired: { preset: 'veo' } },
+    slots: {
+      'course.research': 'former:old-model',
+      'course.outline': { model: 'operator:deepseek-v4-pro', fallback: 'former:old-model' },
+      classroom: 'operator:deepseek-v4-pro',
+      video: 'retired:veo-3.1-generate-preview',
+    },
+  };
+  const next = await applyModelSettingsChange(current, {
+    kind: 'provider',
+    id: 'replacement',
+    preset: 'openai',
+    apiKey: 'example-key',
+  });
+  expect(next.providers?.replacement?.preset).toBe('openai');
+  expect(next.slots).toEqual({
+    'course.outline': { model: 'operator:deepseek-v4-pro' },
+    classroom: 'operator:deepseek-v4-pro',
+  });
+  await expect(
+    applyModelSettingsChange(next, {
+      kind: 'slots',
+      set: { 'course.research': 'former:old-model' },
+    }),
+  ).rejects.toMatchObject({ code: 'INVALID_ASSIGNMENT' });
+});
+
+it.each([undefined, { preset: 'veo' }])(
+  'preserves saved slots when restoring the original provider id (%j)',
+  async (previous) => {
+    const slots = {
+      classroom: 'restored:gpt-5.5',
+      'course.outline': { model: 'operator:deepseek-v4-pro', fallback: 'restored:gpt-5.5' },
+    };
+    const next = await applyModelSettingsChange(
+      { providers: previous ? { restored: previous } : {}, slots },
+      { kind: 'provider', id: 'restored', preset: 'openai', apiKey: 'example-key' },
+    );
+    expect(next.slots).toEqual(slots);
+    expect(next.providers?.restored.preset).toBe('openai');
+  },
+);
+
+it('repairs missing builtin references only outside the webFetch slot', async () => {
+  const next = await applyModelSettingsChange(
+    {
+      slots: {
+        classroom: 'builtin:old-model',
+        'course.outline': { model: 'operator:deepseek-v4-pro', fallback: 'builtin:old-model' },
+        webFetch: 'builtin',
+      },
+    },
+    { kind: 'provider', id: 'replacement', preset: 'openai', apiKey: 'example-key' },
+  );
+  expect(next.slots).toEqual({
+    'course.outline': { model: 'operator:deepseek-v4-pro' },
+    webFetch: 'builtin',
+  });
+});
+
 describe('modelSettingsView', () => {
   it('offers only deployment slot models when the provider has no model list', async () => {
     const config: ModelConfigLayer['config'] = {
@@ -1015,5 +1077,62 @@ describe('importModelSettings with declared context windows', () => {
     });
     expect(result.imported).toEqual([{ kind: 'provider', id: 'mine' }]);
     expect(result.config.providers?.mine.modelContextWindows).toEqual({ mystery: 1_000_000 });
+  });
+});
+
+describe('capabilities the account behind a key does not have', () => {
+  const save = (current: Parameters<typeof applyModelSettingsChange>[0], apiKey?: string) =>
+    applyModelSettingsChange(
+      current,
+      { kind: 'provider', id: 'go', preset: 'minimax-intl', ...(apiKey ? { apiKey } : {}) },
+      apiKey ? { unsupportedCapabilities: ['video'] } : {},
+    );
+
+  beforeEach(() => deployment({}));
+
+  it('stores what the vendor reported with the key and stops offering it', async () => {
+    const next = await save(null, 'sk-cp-go');
+    expect(next.providers?.go?.unsupportedCapabilities).toEqual(['video']);
+    const view = modelSettingsView({ config: next, revision: 1, unreadableSecrets: [] });
+    const provider = view.providers.find((entry) => entry.id === 'go')!;
+    expect(provider.capabilities.video).toBeUndefined();
+    expect(provider.capabilities.image).toBeDefined();
+    await expect(
+      applyModelSettingsChange(next, { kind: 'slots', set: { video: 'go:MiniMax-Hailuo-2.3' } }),
+    ).rejects.toMatchObject({ code: 'INVALID_ASSIGNMENT' });
+  });
+
+  it('drops the video assignment a new key without video leaves behind, and nothing else', async () => {
+    const before = {
+      providers: {
+        go: { preset: 'minimax-intl', apiKey: 'sk-cp-plus' },
+        other: { preset: 'minimax', apiKey: 'sk-cp-cn' },
+      },
+      slots: { video: 'go:MiniMax-Hailuo-2.3', image: 'go:image-01', tts: 'other:speech-2.8-hd' },
+    } as Parameters<typeof applyModelSettingsChange>[0];
+    const next = await save(before, 'sk-cp-go');
+    expect(next.slots).toEqual({ image: 'go:image-01', tts: 'other:speech-2.8-hd' });
+    // Another plan's video stays where it is.
+    const elsewhere = await save({ ...before, slots: { video: 'other:T2V-01' } }, 'sk-cp-go');
+    expect(elsewhere.slots).toEqual({ video: 'other:T2V-01' });
+  });
+
+  it('keeps the finding on an edit that keeps the key, and forgets it with a new key', async () => {
+    const connected = await save(null, 'sk-cp-go');
+    const edited = await applyModelSettingsChange(connected, {
+      kind: 'provider',
+      id: 'go',
+      preset: 'minimax-intl',
+      models: ['MiniMax-M3'],
+    });
+    expect(edited.providers?.go?.unsupportedCapabilities).toEqual(['video']);
+    // A new key the vendor said nothing about: the preset's capabilities stand.
+    const rekeyed = await applyModelSettingsChange(connected, {
+      kind: 'provider',
+      id: 'go',
+      preset: 'minimax-intl',
+      apiKey: 'sk-cp-max',
+    });
+    expect(rekeyed.providers?.go?.unsupportedCapabilities).toBeUndefined();
   });
 });

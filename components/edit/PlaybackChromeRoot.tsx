@@ -270,7 +270,10 @@ export const PlaybackChromeRoot = forwardRef<PlaybackChromeRootHandle, PlaybackC
 
     // Cue user state (Issue 7)
     const [isCueUser, setIsCueUser] = useState(false);
-    const [cueUserOptions, setCueUserOptions] = useState<string[] | undefined>();
+    const [cueUserReplies, setCueUserReplies] = useState<{
+      labels: string[];
+      fromAgentId?: string;
+    }>();
 
     // End flash state (Issue 3)
     const [showEndFlash, setShowEndFlash] = useState(false);
@@ -512,7 +515,7 @@ export const PlaybackChromeRoot = forwardRef<PlaybackChromeRootHandle, PlaybackC
       setSpeechProgress(null);
       setThinkingState(null);
       setIsCueUser(false);
-      setCueUserOptions(undefined);
+      setCueUserReplies(undefined);
       setIsTopicPending(false);
       setChatIsStreaming(false);
       setChatIsSoftClosing(false);
@@ -538,9 +541,11 @@ export const PlaybackChromeRoot = forwardRef<PlaybackChromeRootHandle, PlaybackC
     /** Request failure should exit live discussion UI without hard-closing the session. */
     const handleLiveSessionError = useCallback(() => {
       engineRef.current?.handleDiscussionError();
+      // The failed turn's remaining speech must not keep playing after its UI is gone.
+      discussionTTS.cleanup();
       resetLiveState();
       setActiveBubbleId(null);
-    }, [resetLiveState]);
+    }, [resetLiveState, discussionTTS]);
 
     /**
      * Unified session cleanup — called by both roundtable stop button and chat area end button.
@@ -640,13 +645,14 @@ export const PlaybackChromeRoot = forwardRef<PlaybackChromeRootHandle, PlaybackC
       ref,
       () => ({
         teardown: async () => {
+          // Silence speech first: ending the session can wait on a whiteboard action.
+          discussionTTS.cleanup();
           await chatAreaRef.current?.endActiveSession();
           if (discussionAbortRef.current) {
             discussionAbortRef.current.abort();
             discussionAbortRef.current = null;
           }
           engineRef.current?.stop();
-          discussionTTS.cleanup();
           resetSceneState();
         },
         pauseForInteractiveMedia: () => {
@@ -782,6 +788,10 @@ export const PlaybackChromeRoot = forwardRef<PlaybackChromeRootHandle, PlaybackC
         // Bump epoch so any stale SSE callbacks from the previous scene are discarded
         sceneEpochRef.current++;
 
+        // Stop any in-flight discussion TTS audio on scene switch, before the wait
+        // below, so the previous scene's next line cannot start during it.
+        discussionTTS.cleanup();
+
         // Wait for an in-flight presentation action before initializing the next
         // scene against shared whiteboard state.
         await chatAreaRef.current?.endActiveSession({ source: 'scene_switch' });
@@ -792,9 +802,6 @@ export const PlaybackChromeRoot = forwardRef<PlaybackChromeRootHandle, PlaybackC
           discussionAbortRef.current.abort();
           discussionAbortRef.current = null;
         }
-
-        // Stop any in-flight discussion TTS audio on scene switch
-        discussionTTS.cleanup();
 
         const sessionResumeCursor =
           currentScene && typeof window !== 'undefined'
@@ -1787,6 +1794,8 @@ export const PlaybackChromeRoot = forwardRef<PlaybackChromeRootHandle, PlaybackC
         if (isTextEntryTarget(event.target) || isTextEntryTarget(document.activeElement)) {
           return;
         }
+        // A focused video or audio element seeks and sets its own volume with the arrow keys.
+        if (event.key.startsWith('Arrow') && event.target instanceof HTMLMediaElement) return;
 
         switch (event.key) {
           case 'ArrowLeft':
@@ -1916,6 +1925,8 @@ export const PlaybackChromeRoot = forwardRef<PlaybackChromeRootHandle, PlaybackC
       if (currentScene?.type === 'quiz') setMobilePanel(null);
     }
     const [mobileComposerHost, setMobileComposerHost] = useState<HTMLDivElement | null>(null);
+    const [mobileQuickReplyHost, setMobileQuickReplyHost] = useState<HTMLDivElement | null>(null);
+    const showMobileQuickReplies = mobile && mobilePanel === 'chat' && !!cueUserReplies;
     // A user choice is scoped to this scene, not to global desktop dock preferences.
     const [mobileDockChoice, setMobileDockChoice] = useState<{
       sceneId: string | null;
@@ -2130,7 +2141,9 @@ export const PlaybackChromeRoot = forwardRef<PlaybackChromeRootHandle, PlaybackC
               {courseEnd && !isPendingScene ? (
                 <CourseEndLayer
                   key="course-end"
-                  overInteractive={currentScene?.type === 'interactive'}
+                  overPortaledScene={
+                    currentScene?.type === 'interactive' || currentScene?.type === 'pbl'
+                  }
                   mobileStage={mobile ? stageRef.current?.closest('[data-classroom-stage]') : null}
                 >
                   <CourseEnd
@@ -2205,7 +2218,8 @@ export const PlaybackChromeRoot = forwardRef<PlaybackChromeRootHandle, PlaybackC
                 endFlashSessionType={endFlashSessionType}
                 thinkingState={thinkingState}
                 isCueUser={isCueUser}
-                cueUserOptions={cueUserOptions}
+                cueUserOptions={cueUserReplies?.labels}
+                mobileQuickReplyHost={showMobileQuickReplies ? mobileQuickReplyHost : null}
                 isSoftClosing={chatIsSoftClosing}
                 softCloseDeadline={softCloseDeadline}
                 isTopicPending={isTopicPending}
@@ -2255,10 +2269,10 @@ export const PlaybackChromeRoot = forwardRef<PlaybackChromeRootHandle, PlaybackC
                   } else {
                     void sendMessageWithElementReference(msg, elementReferenceSnapshot);
                   }
-                  // Auto-switch to chat tab when user sends a message
-                  chatAreaRef.current?.switchToTab('chat');
+                  // A send returns the learner to the latest messages on mobile.
+                  chatAreaRef.current?.switchToTab('chat', { followLatest: true });
                   setIsCueUser(false);
-                  setCueUserOptions(undefined);
+                  setCueUserReplies(undefined);
                   // Immediately mark streaming for synchronized stop button
                   setChatIsStreaming(true);
                   setChatSessionType(chatSessionType || 'qa');
@@ -2382,6 +2396,15 @@ export const PlaybackChromeRoot = forwardRef<PlaybackChromeRootHandle, PlaybackC
           )}
           <ChatArea
             mobile={mobile}
+            mobileQuickReply={
+              showMobileQuickReplies
+                ? {
+                    fromAgentId: cueUserReplies?.fromAgentId,
+                    host: mobileQuickReplyHost,
+                    onHostChange: setMobileQuickReplyHost,
+                  }
+                : undefined
+            }
             onTabChange={mobile ? (panel) => setMobilePanel(panel) : undefined}
             ref={chatAreaRef}
             width={chatAreaWidth}
@@ -2432,16 +2455,18 @@ export const PlaybackChromeRoot = forwardRef<PlaybackChromeRootHandle, PlaybackC
                 setThinkingState(state);
               });
             }}
-            onCueUser={(_fromAgentId, _prompt, options) => {
-              setCueUserOptions(normalizeCueUserOptions(options));
+            onCueUser={(fromAgentId, _prompt, options) => {
+              const labels = normalizeCueUserOptions(options);
+              setCueUserReplies(labels ? { labels, fromAgentId } : undefined);
               setIsCueUser(true);
             }}
             onLiveSessionError={handleLiveSessionError}
+            onLiveSessionStopping={discussionTTS.cleanup}
             onSoftCloseSession={() => {
               setThinkingState(null);
               setSpeechProgress(null);
               setIsCueUser(false);
-              setCueUserOptions(undefined);
+              setCueUserReplies(undefined);
               setActiveBubbleId(null);
             }}
             onSoftClosingChange={(softClosing, deadline) => {

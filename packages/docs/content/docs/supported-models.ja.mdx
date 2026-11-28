@@ -90,12 +90,12 @@ description: オープンソース版 OpenMAIC の組み込みモデルと provi
 
 | 提供元        | Provider ID     | 組み込みモデル                                                                                                                                                                                                                                                                                                                                                                                                              |
 | ------------- | --------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Seedance      | `seedance`      | Seedance 2.0 (`doubao-seedance-2-0-260128`)<br />Seedance 2.0 Fast (`doubao-seedance-2-0-fast-260128`)<br />Seedance 2.0 Mini (`doubao-seedance-2-0-mini-260615`)<br />Seedance 1.0 Pro (`doubao-seedance-1-0-pro-250528`)<br />Seedance 1.0 Pro Fast (`doubao-seedance-1-0-pro-fast-251015`)<br />Seedance 1.0 Lite T2V (`doubao-seedance-1-0-lite-t2v-250428`) |
+| Seedance      | `seedance`      | Seedance 2.0 (`doubao-seedance-2-0-260128`)<br />Seedance 2.0 Fast (`doubao-seedance-2-0-fast-260128`)<br />Seedance 2.0 Mini (`doubao-seedance-2-0-mini-260615`) |
 | Kling         | `kling`         | Kling V2.6 (`kling-v2-6`)<br />Kling V1.6 (`kling-v1-6`)                                                                                                                                                                                                                                                                                                                                                                  |
 | MiniMax Video | `minimax-video` | Hailuo 2.3 (`MiniMax-Hailuo-2.3`)<br />Hailuo 02 (`MiniMax-Hailuo-02`)<br />T2V-01 Director (`T2V-01-Director`)<br />T2V-01 (`T2V-01`)                                                                                                                                                                                                                                                                                    |
 | Grok Video    | `grok-video`    | Grok Imagine Video (`grok-imagine-video`)                                                                                                                                                                                                                                                                                                                                                                                 |
 | HappyHorse    | `happyhorse`    | HappyHorse 1.0 T2V (`happyhorse-1.0-t2v`)                                                                                                                                                                                                                                                                                                                                                                                 |
-| OpenRouter Video | `openrouter-video` | Veo 3.1 (`google/veo-3.1`)<br />Kling v3.0 Pro (`kwaivgi/kling-v3.0-pro`)<br />Seedance 2.5 (`bytedance/seedance-2.5`) |
+| OpenRouter Video | `openrouter-video` | Veo 3.1 (`google/veo-3.1`)<br />Seedance 2.5 (`bytedance/seedance-2.5`) |
 
 ## TTS モデルとバックエンド
 
@@ -119,7 +119,13 @@ description: オープンソース版 OpenMAIC の組み込みモデルと provi
 
 Google TTS の既定モデルは `gemini-3.8-flash-lite-tts` です。明示的に選択済みのモデルは変更されません。Google が公表する上記 3 つのプレビューモデルの[最も早い提供終了日](https://ai.google.dev/gemini-api/docs/deprecations)は **2026 年 11 月 17 日**です。終了前に 3.8 モデルに切り替えてください。デプロイ側で管理する認証情報を使う場合は、`openmaic.yml` の `tts` スロットまたはプロバイダーの `models` 許可リストも更新します。Gemini 3.8 の WAV 応答はそのまま保持し、旧モデルの PCM 応答は引き続き再生用の WAV に変換します。
 
-管理されたデプロイでは、音声クローンの対象モデルに加えて `qwen3-tts-flash` も許可してください。例：`TTS_QWEN_MODELS=qwen3-tts-flash,cosyvoice-v3.5-plus`。または、`openmaic.yml` のプロバイダーの `models` 許可リストに両方を指定します。クローン対象だけを指定すると、カタログ音声モデルへの暗黙の許可が置き換わり、カタログ音声のリクエストが HTTP 403 になります。使用中の他のモデルの許可も残してください。
+管理されたデプロイでは、`openmaic.yml` のプロバイダーの `models` に `qwen3-tts-flash` と音声クローンの対象モデル（例：`cosyvoice-v3.5-plus`）の両方を指定します。クローン対象だけを指定すると、カタログ音声モデルへの暗黙の許可が置き換わり、カタログ音声のリクエストが HTTP 403 になります。使用中の他のモデルの許可も残してください。
+
+### MiniMax のカスタム音声
+
+音声設定で 10～60 秒の録音をアップロードし、音声に名前を付けます。保存するとエージェントの音声選択画面ですぐに使えます。MiniMax のアカウント一覧には初回の音声合成後に表示され、その際に有効化料金がかかる場合があります。
+
+自分の MiniMax キーを使うと、アカウントの音声も表示されます。`voices` が設定されている場合は、その一覧が優先されます。共有キーの場合は、設定済みの音声（未設定なら組み込みのプリセット）と自分がこのブラウザーに保存した音声を選べます。ローカルからの削除はこのブラウザーにのみ反映されます。MiniMax から削除するには自分のキーを使用し、別途確認してください。
 
 ## ASR モデル
 
@@ -168,7 +174,7 @@ Google TTS の既定モデルは `gemini-3.8-flash-lite-tts` です。明示的�
 
 `deepseek` プリセットはチャット、Web 検索、ホスト型 Markdown 抽出で `DEEPSEEK_API_KEY` と API ベース URL を共有します。検索は `POST /v1/tools/search` を使い、最大 50 件を返します。クエリは Unicode コードポイント単位で 128 文字に切り詰め、結果には `summary`、空の場合は `snippet` を使います。取得は `POST /v1/tools/fetch` を使い、`content` と空でない任意の `title` を読み取ります。
 
-旧設定では `WEB_SEARCH_DEEPSEEK_ENABLED=true`、または `server-providers.yml` の明示的な `web-search.deepseek` エントリーで有効にします。チャットの認証情報だけでは検索を有効にせず、既存の検索の既定値も変更しません。`WEB_SEARCH_DEEPSEEK_ENABLED=false` は検索を強制無効化します。`openmaic.yml` がある場合、旧変数はスロットを割り当てられません。プロバイダーを宣言し、`webSearch` と／または `webFetch` を明示的に割り当ててください。
+`openmaic.yml` でプロバイダーを宣言し、次のスロットに割り当ててください： `webSearch` / `webFetch`。 `WEB_SEARCH_DEEPSEEK_ENABLED=false` を指定すると検索は引き続き無効になります。
 
 The default API base is `https://api.deepseek.com/v1`. On `api.deepseek.com`, every base path (including `/beta`) is normalized to `/v1` before appending `/tools/search` or `/tools/fetch`. Custom gateway bases preserve their configured path prefix; a bare root gets `/v1` first. Custom endpoints belong in deployment configuration, while client and workspace overrides remain restricted to official endpoints. The default fetch reader remains `builtin`. See [DeepSeek official pricing](https://api-docs.deepseek.com/quick_start/pricing) for current request charges. Failed requests and searches with no results are not billed.
 
@@ -189,11 +195,11 @@ slots:
 
 Open Platform の `https://api.moonshot.cn/v1` と `https://api.moonshot.ai/v1` は `/tools/search_pro` を使用します。結果の本文はページの断片を連結し、本文がなければ要約を使用します。コーディングプランの `https://api.kimi.com/coding/v1` と `https://api.kimi.ai/coding/v1` は `/search` を使用し、ページの取得を有効にします。結果には要約よりもページ本文を優先します。1 回のリクエストで返す結果は最大 20 件です。
 
-従来の設定では、チャットの認証情報だけで検索が有効になることはありません。`WEB_SEARCH_KIMI_ENABLED=true` を設定するか、`server-providers.yml` に `web-search.kimi` を明示的に追加してください。`openmaic.yml` では `webSearch` スロットを明示的に割り当てます。ウィザードが検索を推奨するのは、公式のベース URL を使用するアカウントだけです。
+`openmaic.yml` またはモデル設定でプロバイダーとスロットを設定してください。 ウィザードが検索を推奨するのは、公式のベース URL を使用するアカウントだけです。
 
 エンドポイントはベース URL のパスで決まります。末尾のスラッシュを除いたパスが `/coding/v1` で終わる場合は `/search`、それ以外は `/tools/search_pro` を使用します。`openmaic.yml` で設定するカスタムプロキシも、このパス構造を維持する必要があります。
 
-`openmaic.yml` がある場合、従来の環境変数 `WEB_SEARCH_KIMI_ENABLED` だけでは検索スロットは割り当てられないため、`providers.<id>: { preset: kimi }` を宣言し、`slots.webSearch: <id>` を指定してください。
+デプロイで Kimi 検索を設定するには、`openmaic.yml` で `providers.<id>: { preset: kimi }` を宣言し、`slots.webSearch: <id>` を設定します。`WEB_SEARCH_KIMI_ENABLED=false` で Kimi 検索を引き続き強制無効化できます。
 
 ## Webページ取得
 

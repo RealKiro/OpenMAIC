@@ -1,7 +1,16 @@
 import 'server-only';
+import { fromMarkdown } from 'mdast-util-from-markdown';
+import type { AgentMessage } from '@earendil-works/pi-agent-core';
 import type { Queryable } from '@openmaic/storage/agent-session/pg';
 
 export const LEARNER_HANDOFF_EVENT = 'pbl_learner_handoff';
+/** Durable assistant-frame metadata, set by the host only after verifying an exact speech replay. */
+export const REPLAYED_HANDOFF_SPEECH = 'pblReplayedHandoffSpeech';
+/** The host settled this recovery against its earlier spoken question, with or without a new hint. */
+export const RETAINED_REVIEW = 'pblRetainedReview';
+/** Original speech frame kept by a recovered review, independent of the registering attempt. */
+export const REVIEW_SOURCE_AT = 'pblReviewSourceAt';
+export type SpokenReview = { question: string; spokenAt: number };
 
 /** One authored message supplies both display text and the question recorded for feedback. */
 export function reviewResponse(response: string): { response: string; question: string } {
@@ -12,6 +21,205 @@ export function reviewResponse(response: string): { response: string; question: 
     .at(-1)!
     .trim();
   return { response: text, question };
+}
+
+/** In an add_hint delivery only a standalone, verbatim closing belongs to the original question. */
+export function reviewHintEnd(words: string, question: string) {
+  const text = words.trimEnd();
+  if (!text.endsWith(question)) return words.length;
+  const start = text.length - question.length;
+  const before = text.slice(0, start);
+  const paragraph = fromMarkdown(text).children.at(-1);
+  // Examples in blockquotes, code, links and literal paths remain part of the hint.
+  if (paragraph?.type !== 'paragraph' || /[:：]\s*$/u.test(before)) return words.length;
+  const atProse = paragraph.children.some((node) => {
+    const position = node.position!;
+    return (
+      position.start.offset === start ||
+      (node.type === 'text' && position.start.offset! < start && start < position.end.offset!)
+    );
+  });
+  if (!atProse) return words.length;
+  if (start === paragraph.position!.start.offset) return before.trimEnd().length;
+  // Within the paragraph an actual spoken sentence must end. A soft line wrap can
+  // introduce the very text the learner needs to enter. Emphasis is still prose;
+  // punctuation inside a code span, link address or other literal is not.
+  const hint = before.trimEnd();
+  const ending = fromMarkdown(hint).children.at(-1);
+  let last = ending?.type === 'paragraph' ? ending.children.at(-1) : undefined;
+  while (last?.type === 'strong' || last?.type === 'emphasis') last = last.children.at(-1);
+  const sentenceEnded =
+    last?.type === 'text' &&
+    (/[。！？]$/u.test(last.value) || (/[.!?]$/u.test(last.value) && hint.length < before.length));
+  return sentenceEnded ? hint.length : words.length;
+}
+
+/** These tools affect presentation or language, without changing the subject of the reply. */
+export function preservesSpokenClosing(name: string) {
+  return (
+    name.startsWith('wb_') ||
+    ['cue_user', 'point_at_code', 'point_at_preview', 'set_response_language'].includes(name)
+  );
+}
+
+export function isSpokenHandoff(name: string) {
+  return ['request_skill_review', 'respond_to_learner', 'request_learner_help'].includes(name);
+}
+
+export function spokenHandoffClosing() {
+  // message_end feeds this same record from the live stream and from durable history on resume.
+  type Speech = { blocks: string[]; spokenAt: number; guidanceOnly?: boolean; bareStop?: boolean };
+  let source: { frames: Speech[]; recovering: boolean; questionAt?: number } | undefined;
+  let frames: Speech[] = [];
+  let hasCurrentSpeech = false;
+  let retainedAt: number | undefined;
+  let calls: { name: string; id: string; arguments: Record<string, unknown> }[] = [];
+  return {
+    observe(message: AgentMessage) {
+      if (message.role === 'toolResult') return;
+      calls = [];
+      frames = [];
+      hasCurrentSpeech = false;
+      if (message.role !== 'assistant' || ['error', 'aborted'].includes(message.stopReason)) {
+        source = undefined;
+        return;
+      }
+      const tools = message.content.filter((part) => part.type === 'toolCall');
+      const handoffs = tools.filter((tool) => isSpokenHandoff(tool.name));
+      const mixedAssistance =
+        source?.recovering &&
+        handoffs.some((tool) => tool.name === 'request_skill_review') &&
+        handoffs.some((tool) => tool.name !== 'request_skill_review');
+      const retainsReview = RETAINED_REVIEW in message && message[RETAINED_REVIEW] === true;
+      retainedAt =
+        retainsReview &&
+        REVIEW_SOURCE_AT in message &&
+        typeof message[REVIEW_SOURCE_AT] === 'number'
+          ? message[REVIEW_SOURCE_AT]
+          : undefined;
+      const blocks = message.content.flatMap((part) =>
+        part.type === 'text' && part.text.trim() ? [part.text] : [],
+      );
+      const current = blocks.length
+        ? {
+            blocks,
+            spokenAt: message.timestamp,
+            guidanceOnly: retainsReview || mixedAssistance,
+            bareStop: !tools.length && message.stopReason === 'stop',
+          }
+        : undefined;
+      hasCurrentSpeech = !!current;
+      const operations = tools.filter(
+        (tool) => !isSpokenHandoff(tool.name) && !preservesSpokenClosing(tool.name),
+      );
+      if (operations.length) {
+        // A sibling file operation can accompany this message's speech. Its result
+        // invalidates the source for all later messages, including recovery attempts.
+        const previous = source;
+        source = undefined;
+        if (operations.some((op) => op.name !== 'read_file' && op.name !== 'write_file')) return;
+        if (
+          previous?.recovering &&
+          (retainsReview ||
+            (REPLAYED_HANDOFF_SPEECH in message && message[REPLAYED_HANDOFF_SPEECH] === true))
+        )
+          frames = previous.frames;
+        else if (current) frames = [current];
+        else return;
+      } else {
+        if (current) {
+          source ??= { frames: [], recovering: false };
+          // A plain stop delivered words without handing control back to the learner.
+          if (!tools.length && message.stopReason === 'stop') source.recovering = true;
+          source.frames.push(current);
+        }
+        if (source && handoffs.some((call) => call.name === 'request_skill_review')) {
+          if (retainedAt !== undefined) source.questionAt = retainedAt;
+          else if (current && !current.guidanceOnly) source.questionAt = current.spokenAt;
+        }
+        frames = source?.frames ?? [];
+      }
+      // An assistance turn can keep the existing question, but cannot also
+      // checkpoint its advice as learner review or approval.
+      calls = mixedAssistance
+        ? handoffs.filter((call) => call.name !== 'request_skill_review')
+        : handoffs;
+    },
+    recoverySpeech(): readonly string[] | undefined {
+      return source?.recovering ? source.frames.flatMap((frame) => frame.blocks) : undefined;
+    },
+    recoveryQuestions(): SpokenReview[] {
+      if (!source?.recovering) return [];
+      const candidates = source.frames.filter((frame) => !frame.guidanceOnly);
+      const last = candidates.at(-1);
+      // Old workers could stop twice without registering either closing. Only
+      // the author knows which was the question and which was an introduction or hint.
+      const unmarked = candidates.filter((frame) => frame.bareStop);
+      const selected =
+        source.questionAt !== undefined
+          ? candidates.filter((frame) => frame.spokenAt === source!.questionAt)
+          : unmarked.length > 1
+            ? candidates.filter((frame) => frame.bareStop || frame === last)
+            : last
+              ? [last]
+              : [];
+      return selected.map((frame) => ({
+        question: reviewResponse(frame.blocks.at(-1)!).question,
+        spokenAt: frame.spokenAt,
+      }));
+    },
+    forCall(id: string): { question: string; spokenAt?: number } | undefined {
+      const call = calls.find((tool) => tool.id === id);
+      if (!call) return undefined;
+      // Older in-flight calls could supply both prose and a different question. Only the
+      // author can distinguish an introduction from a closing invitation in arbitrary prose.
+      if (
+        (call.arguments.askNewQuestion === true ||
+          call.arguments.reviewDelivery === 'ask_question') &&
+        !hasCurrentSpeech
+      )
+        throw new Error('Speak the missing review question before registering it.');
+      if (call.arguments.reviewDelivery === 'add_hint' && !hasCurrentSpeech)
+        throw new Error('Speak only the missing hint. Keep the original question pending.');
+      if (call.arguments.deliverMissing === true && !hasCurrentSpeech)
+        throw new Error('Speak the missing information before registering it.');
+      const review = call.name === 'request_skill_review';
+      const legacy =
+        call.name === 'respond_to_learner' ? call.arguments.response : call.arguments.question;
+      const supplied = typeof legacy === 'string' ? legacy.trim() : '';
+      const last = review
+        ? frames.findLast(
+            (frame) =>
+              !frame.guidanceOnly && (retainedAt === undefined || frame.spokenAt === retainedAt),
+          )
+        : frames.at(-1);
+      if (review && retainedAt !== undefined && !last) return undefined;
+      if (last) {
+        const closing = reviewResponse(last.blocks.at(-1)!);
+        const delivery = review ? closing.question : closing.response;
+        if (
+          supplied &&
+          supplied !== delivery &&
+          supplied !== closing.question &&
+          (!review || hasCurrentSpeech)
+        ) {
+          // Old assistance calls copied the entire delivered answer. Match whole paragraphs,
+          // including earlier blocks, without moving that speech to the recovery attempt.
+          const words = frames.map((frame) => frame.blocks.join('\n').trim()).join('\n\n');
+          if (call.name !== 'respond_to_learner' || !('\n\n' + words).endsWith('\n\n' + supplied))
+            throw new Error(
+              !review
+                ? 'The supplied text differs from the spoken closing. Speak any missing information once, then register it without text.'
+                : 'Two different review texts were supplied. If you already asked the question, register it with an empty call. If you only gave an introduction, speak the missing question once and register it without a question argument.',
+            );
+        }
+        return { question: delivery, spokenAt: last.spokenAt };
+      }
+      if (review && frames.some((frame) => frame.guidanceOnly)) return undefined;
+      // A tool-only call issued under the old schema can still finish after an upgrade.
+      return typeof legacy === 'string' && supplied ? { question: legacy } : undefined;
+    },
+  };
 }
 
 /** Support-only inputs stay in history but cannot become later understanding/approval evidence. */
@@ -33,15 +241,18 @@ export async function supportTurnSequences(
 }
 
 /** A committed full response is the sole prose delivery for its input; tool cards stay visible. */
-function reviewReceipt(event: {
-  type: string;
-  data: unknown;
-}): { text: string; canonical: boolean } | null {
+type ReviewReceipt = { text: string; canonical: boolean; spokenAt?: number };
+
+function reviewReceipt(event: { type: string; data: unknown }): ReviewReceipt | null {
   if (!event.data || typeof event.data !== 'object') return null;
   if (event.type === LEARNER_HANDOFF_EVENT) {
-    const data = event.data as { question?: unknown; canonical?: unknown };
+    const data = event.data as { question?: unknown; canonical?: unknown; spokenAt?: unknown };
     return typeof data.question === 'string' && data.question.trim()
-      ? { text: data.question, canonical: data.canonical === true }
+      ? {
+          text: data.question,
+          canonical: data.canonical === true,
+          spokenAt: typeof data.spokenAt === 'number' ? data.spokenAt : undefined,
+        }
       : null;
   }
   if (event.type !== 'tool_execution_end') return null;
@@ -50,13 +261,7 @@ function reviewReceipt(event: {
     isError?: boolean;
     result?: { content?: { type: string; text?: string }[] };
   };
-  if (
-    !['request_skill_review', 'request_learner_help', 'respond_to_learner'].includes(
-      data.toolName ?? '',
-    ) ||
-    data.isError
-  )
-    return null;
+  if (!isSpokenHandoff(data.toolName ?? '') || data.isError) return null;
   for (const block of data.result?.content ?? []) {
     if (block.type !== 'text' || !block.text) continue;
     try {
@@ -68,37 +273,40 @@ function reviewReceipt(event: {
       )
         return { text: receipt.response, canonical: true };
       if (data.toolName === 'respond_to_learner' && typeof receipt.response === 'string')
-        return { text: receipt.response, canonical: false };
-      if (typeof receipt.question === 'string') return { text: receipt.question, canonical: false };
+        return {
+          text: receipt.response,
+          canonical: false,
+          spokenAt: typeof receipt.spokenAt === 'number' ? receipt.spokenAt : undefined,
+        };
+      if (typeof receipt.question === 'string')
+        return {
+          text: receipt.question,
+          canonical: false,
+          spokenAt: typeof receipt.spokenAt === 'number' ? receipt.spokenAt : undefined,
+        };
     } catch {
       /* Malformed or unrelated output is not a teaching response. */
     }
   }
   return null;
 }
-export function reviewQuestion(event: { type: string; data: unknown }): string | null {
-  return reviewReceipt(event)?.text ?? null;
-}
-export function canonicalReview(event: { type: string; data: unknown }): boolean {
-  return reviewReceipt(event)?.canonical === true;
-}
-
 /** Prefer the ordered SDK display event; the atomic handoff survives a crash before it arrives. */
-export function reviewQuestions(events: readonly { id: number; type: string; data: unknown }[]) {
-  const displayed = new Set(
-    events.flatMap((event) => {
-      if (event.type !== 'tool_execution_end' || !reviewQuestion(event)) return [];
-      const id = (event.data as { toolCallId?: unknown }).toolCallId;
-      return typeof id === 'string' ? [id] : [];
-    }),
-  );
-  const questions = new Map<number, string>();
+export function reviewQuestions(
+  events: readonly { id: number; attempt?: number; type: string; data: unknown }[],
+) {
+  const questions = new Map<number, ReviewReceipt>();
+  const displayed = new Set<string>();
+  const atomic = new Map<number, string>();
   for (const event of events) {
-    const id = (event.data as { toolCallId?: unknown } | null)?.toolCallId;
-    if (event.type === LEARNER_HANDOFF_EVENT && typeof id === 'string' && displayed.has(id))
-      continue;
-    const question = reviewQuestion(event);
-    if (question !== null) questions.set(event.id, question);
+    const receipt = reviewReceipt(event);
+    if (!receipt) continue;
+    questions.set(event.id, receipt);
+    const id = (event.data as { toolCallId?: unknown }).toolCallId;
+    if (typeof id !== 'string') continue;
+    const call = `${event.attempt ?? ''}:${id}`;
+    if (event.type === 'tool_execution_end') displayed.add(call);
+    else atomic.set(event.id, call);
   }
+  for (const [event, call] of atomic) if (displayed.has(call)) questions.delete(event);
   return questions;
 }

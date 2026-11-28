@@ -1,7 +1,8 @@
 'use client';
 import { parseFileReference, type FileReference } from '@/lib/pbl/v3/file-reference';
-import { hasTaskDrawer, TASK_DRAWER_LINK } from '@/lib/pbl/v3/presentation';
-import type { MouseEvent, ReactNode } from 'react';
+import { hasTaskDrawer, stageCompletionCopy, TASK_DRAWER_LINK } from '@/lib/pbl/v3/presentation';
+import { completionHandoff } from '@/lib/pbl/v3/narration';
+import type { CSSProperties, MouseEvent, ReactNode } from 'react';
 import { Route, Code2, GraduationCap, ListChecks, MessageSquareText } from 'lucide-react';
 import { TextBlock } from '@/components/workbench/chat/text-block';
 import { ThinkingBlock } from '@/components/workbench/chat/thinking-block';
@@ -14,6 +15,8 @@ import { UserBubble } from '@/components/workbench/chat/user-bubble';
 import { useI18n } from '@/lib/hooks/use-i18n';
 import type { LearningView } from '@/lib/pbl/v3/types';
 import type { LearningConversationEntry } from '@/lib/pbl/v3/conversation';
+import { ROLE_PERSONAS } from '@/lib/pbl/v3/personas';
+import { AvatarDisplay } from '@/components/ui/avatar-display';
 
 const accents = {
   mentor: 'border-violet-400/40 text-violet-700 dark:text-violet-300',
@@ -46,10 +49,17 @@ function groupParts(parts: Part[]) {
 }
 function AgentTurn({
   entry,
+  files,
   onOpenReport,
+  completion,
+  persona = false,
 }: {
   entry: LearningConversationEntry;
+  files?: readonly string[];
+  completion?: ReturnType<typeof stageCompletionCopy>;
   onOpenReport?: () => void;
+  /** Show the role as a named character, with its face, instead of a role label. */
+  persona?: boolean;
 }) {
   const { t } = useI18n();
   const role = entry.speaker === 'user' ? 'mentor' : entry.speaker;
@@ -61,8 +71,9 @@ function AgentTurn({
   );
   const copyText = entry.parts.flatMap((p) => (p.kind === 'text' ? [p.text] : [])).join('\n\n');
   const parts = entry.parts.filter((part) => part.kind !== 'tool' || !part.recovered);
+  const handoff = completionHandoff(entry, completion?.instruction, completion?.afterMention);
+  const confirmed = handoff && entry.parts[handoff.part];
   if (
-    entry.parts.length &&
     !parts.length &&
     !['running', 'failed', 'cancelled', 'interrupted'].includes(entry.status ?? '')
   )
@@ -74,26 +85,54 @@ function AgentTurn({
       data-status={entry.status}
       data-turn-id={entry.id}
     >
-      <div className={`flex items-center gap-2 text-[13px] font-medium ${accents[role]}`}>
-        <span className="inline-flex size-[22px] items-center justify-center rounded-full bg-current/10">
-          <Icon size={14} />
-        </span>
-        {t(`pblV3.roles.${role}`)}
-      </div>
+      {persona ? (
+        <div className="flex items-center gap-2.5" data-testid="pbl-agent-persona">
+          <span
+            className="size-9 shrink-0 overflow-hidden rounded-full bg-muted ring-2"
+            style={{ '--tw-ring-color': ROLE_PERSONAS[role].color } as CSSProperties}
+          >
+            <AvatarDisplay src={ROLE_PERSONAS[role].avatar} alt="" />
+          </span>
+          <span className="min-w-0 leading-tight">
+            <span className="block text-sm font-semibold text-foreground">
+              {t(`pblV3.personas.${role}`)}
+            </span>
+            <span className={`block text-[11px] font-medium ${accents[role]}`}>
+              {t(`pblV3.roles.${role}`)}
+            </span>
+          </span>
+        </div>
+      ) : (
+        <div className={`flex items-center gap-2 text-[13px] font-medium ${accents[role]}`}>
+          <span className="inline-flex size-[22px] items-center justify-center rounded-full bg-current/10">
+            <Icon size={14} />
+          </span>
+          {t(`pblV3.roles.${role}`)}
+        </div>
+      )}
       <div
         className={`pbl-assistant-bubble flex min-w-0 flex-col gap-[5px] rounded-xl rounded-tl-md border-l-2 px-3 py-2.5 ${accents[role]}`}
       >
         {groupParts(parts).map((part) =>
           Array.isArray(part) ? (
             <div key={part[0].id} className="flex flex-col gap-3">
+              {/* Whiteboard and pointer calls are tool calls like any other in the stream. */}
               <ToolActivity tools={part} t={t} />
-              {part.some((tool) => tool.action === 'complete' && tool.status === 'succeeded') && (
+              {part.some((tool) => tool.acknowledgeResponse) && (
+                <p className="text-foreground">{t('pblV3.journey.acceptedResponse')}</p>
+              )}
+              {part.some(
+                (tool) =>
+                  tool.action === 'complete' &&
+                  tool.status === 'succeeded' &&
+                  (!confirmed || tool === confirmed || tool.projectCompleted),
+              ) && (
                 <p className="text-foreground" data-testid="pbl-completion-handoff">
-                  {t(
-                    part.some((tool) => tool.projectCompleted)
-                      ? 'pblV3.reportCopy.completed'
-                      : 'pblV3.journey.completionHandoff',
-                  )}
+                  {part.some((tool) => tool.projectCompleted)
+                    ? t('pblV3.reportCopy.completed')
+                    : (handoff?.text ??
+                      completion?.instruction ??
+                      t('pblV3.journey.completionHandoff'))}
                 </p>
               )}
               {onOpenReport &&
@@ -104,7 +143,8 @@ function AgentTurn({
                     tool.projectCompleted,
                 ) && (
                   <button
-                    className="rounded-lg bg-violet-600 px-3 py-2 text-xs font-semibold text-white hover:bg-violet-500"
+                    data-pbl-report-handoff
+                    className="pbl-report-action rounded-lg px-3 py-2 text-xs font-semibold"
                     onClick={onOpenReport}
                   >
                     {t('pblV3.report')}
@@ -122,7 +162,12 @@ function AgentTurn({
             />
           ) : part.kind === 'text' ? (
             <div className="pbl-teaching-prose text-foreground" key={part.id}>
-              <TextBlock text={part.text} streaming={part.streaming} variant="lesson" />
+              <TextBlock
+                text={part.text}
+                streaming={part.streaming}
+                variant="lesson"
+                lessonFiles={files}
+              />
             </div>
           ) : null,
         )}
@@ -143,10 +188,16 @@ function AgentTurn({
 }
 function ConversationEntry({
   entry,
+  files,
   onOpenReport,
+  completion,
+  persona,
 }: {
   entry: LearningConversationEntry;
+  files?: readonly string[];
+  completion?: ReturnType<typeof stageCompletionCopy>;
   onOpenReport?: () => void;
+  persona?: boolean;
 }) {
   const { t } = useI18n();
   return entry.boundary ? (
@@ -171,11 +222,19 @@ function ConversationEntry({
       text={entry.parts.flatMap((p) => (p.kind === 'text' ? [p.text] : [])).join('\n')}
     />
   ) : (
-    <AgentTurn key={entry.id} entry={entry} onOpenReport={onOpenReport} />
+    <AgentTurn
+      key={entry.id}
+      entry={entry}
+      files={files}
+      onOpenReport={onOpenReport}
+      persona={persona}
+      completion={completion}
+    />
   );
 }
 export function LearningConversation({
   view,
+  actionsDisabled,
   sent,
   requesting = false,
   modalActive = false,
@@ -183,11 +242,14 @@ export function LearningConversation({
   waitingToStart = false,
   onOpenFile,
   onOpenReport,
+  onHistoryOpenChange,
   onOpenTask,
   overview,
 }: {
   view: LearningView;
+  actionsDisabled: boolean;
   onOpenReport?: () => void;
+  onHistoryOpenChange?: (open: boolean) => void;
   onOpenFile?: (reference: FileReference) => void;
   onOpenTask?: () => void;
   overview?: ReactNode;
@@ -228,6 +290,9 @@ export function LearningConversation({
       onOpenFile(reference);
     }
   };
+  // Where the role is a companion it is shown as one here too: the same face and name.
+  const persona = !!view.explainBoard;
+  const completion = stageCompletionCopy(view, t, actionsDisabled);
   const placeholder = (requesting || view.busy) && !entries.some((e) => e.status === 'running');
   if (waitingToStart) {
     // An ordinary reading pane: no tail observer runs before the learner starts.
@@ -252,12 +317,15 @@ export function LearningConversation({
     >
       <ConversationHistory
         id={view.id}
+        onOpenChange={onHistoryOpenChange}
         sources={view.conversationHistory ?? []}
         milestones={view.milestones}
         renderEntry={(entry, dismiss) => (
           <div onClick={(event) => openReference(event, dismiss)}>
             <ConversationEntry
               entry={entry}
+              files={view.files}
+              persona={persona}
               onOpenReport={
                 onOpenReport
                   ? () => {
@@ -279,11 +347,19 @@ export function LearningConversation({
         <p className="text-sm text-muted-foreground">{t('pblV3.journey.startConversation')}</p>
       )}
       {entries.map((entry) => (
-        <ConversationEntry key={entry.id} entry={entry} onOpenReport={onOpenReport} />
+        <ConversationEntry
+          key={entry.id}
+          entry={entry}
+          files={view.files}
+          completion={entry.currentStage ? completion : undefined}
+          onOpenReport={onOpenReport}
+          persona={persona}
+        />
       ))}
       {pendingMessage && <ConversationEntry entry={pendingMessage} />}
       {placeholder && (
         <AgentTurn
+          persona={persona}
           entry={{ id: 'queued', speaker: view.role ?? 'mentor', status: 'running', parts: [] }}
         />
       )}

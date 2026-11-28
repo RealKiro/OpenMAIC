@@ -14,7 +14,12 @@ import {
   voiceServesModel,
 } from '@/lib/audio/constants';
 import { normalizeVoxCPMBackend } from '@/lib/audio/voxcpm';
-import type { BuiltInTTSProviderId, TTSProviderId, ConfiguredTTSVoice } from '@/lib/audio/types';
+import type {
+  AccountVoice,
+  BuiltInTTSProviderId,
+  TTSProviderId,
+  ConfiguredTTSVoice,
+} from '@/lib/audio/types';
 import {
   currentModelCapabilities,
   type EffectiveTarget,
@@ -34,6 +39,7 @@ export interface SlotTTSProviderConfig {
   /** The provider's non-secret options (a VoxCPM `backend`, say), as the server configures them. */
   providerOptions?: Record<string, string | number | boolean>;
   voices?: ConfiguredTTSVoice[];
+  accountVoices?: AccountVoice[];
 }
 
 export type SlotTTSProvidersConfig = Record<string, SlotTTSProviderConfig>;
@@ -51,7 +57,10 @@ export function slotTTSModel(target: EffectiveTarget): string | undefined {
 }
 
 /** The per-provider map the voice helpers read, for the provider the `tts` slot resolves to. */
-export function slotTTSProvidersConfig(target: EffectiveTarget | null): SlotTTSProvidersConfig {
+export function slotTTSProvidersConfig(
+  target: EffectiveTarget | null,
+  accountVoices: AccountVoice[] = [],
+): SlotTTSProvidersConfig {
   const map: SlotTTSProvidersConfig = {
     // Browser speech is always "configured"; it is off unless it is the slot's.
     [BROWSER_NATIVE_TTS_PROVIDER_ID]: { apiKey: '', baseUrl: '', enabled: false },
@@ -65,6 +74,9 @@ export function slotTTSProvidersConfig(target: EffectiveTarget | null): SlotTTSP
       isServerConfigured: target.registryId !== BROWSER_NATIVE_TTS_PROVIDER_ID,
       ...(modelId ? { modelId } : {}),
       ...(target.voices ? { voices: target.voices } : {}),
+      ...(accountVoices.length && !target.voices?.length && target.providerSource === 'workspace'
+        ? { accountVoices }
+        : {}),
       ...(target.options ? { providerOptions: { ...target.options } } : {}),
     };
   }
@@ -96,29 +108,50 @@ export interface TTSSelection {
   /** The user's voice when it was picked for this provider, else the provider's default. */
   voice: string;
   speed: number;
+  /** A voice refused by this account may still work with a different key. */
+  accountScope?: string;
   providersConfig: SlotTTSProvidersConfig;
 }
 
 /** The user's voice preference and the provider it was picked for. */
-export function voicePreference(): { voice: string; providerId: string; speed: number } {
-  const { ttsVoice, ttsVoiceProviderId, ttsSpeed } = useSettingsStore.getState();
-  return { voice: ttsVoice, providerId: ttsVoiceProviderId, speed: ttsSpeed };
+export function voicePreference(): {
+  voice: string;
+  providerId: string;
+  speed: number;
+  account?: string;
+} {
+  const { ttsVoice, ttsVoiceProviderId, ttsSpeed, ttsVoiceAccount } = useSettingsStore.getState();
+  return {
+    voice: ttsVoice,
+    providerId: ttsVoiceProviderId,
+    speed: ttsSpeed,
+    account: ttsVoiceAccount,
+  };
 }
 
 /** Speech synthesis for these capabilities, or null when the `tts` slot resolves to nothing. */
 export function ttsSelection(
-  capabilities: ModelCapabilities = currentModelCapabilities(),
+  capabilities: Pick<
+    ModelCapabilities,
+    'tts' | 'ttsVoiceAccount' | 'ttsVoiceRejectionScope'
+  > = currentModelCapabilities(),
   preference = voicePreference(),
+  accountVoices?: AccountVoice[],
 ): TTSSelection | null {
   const target = capabilities.tts;
   if (!target) return null;
   const providerId = target.registryId as TTSProviderId;
+  const accountScope = capabilities.ttsVoiceRejectionScope ?? capabilities.ttsVoiceAccount?.scope;
   const model = slotTTSModel(target);
   // The user's voice applies while the slot names its provider and its model
   // can speak it (a voice kept from another model falls back).
   const usable =
     preference.providerId === providerId &&
     !!preference.voice &&
+    (!preference.account ||
+      (preference.account === capabilities.ttsVoiceAccount?.scope &&
+        preference.voice !== capabilities.ttsVoiceAccount.missingVoice) ||
+      target.voices?.some((voice) => voice.id === preference.voice)) &&
     voiceAllowedByConfiguredCatalogue(providerId, preference.voice, target.voices) &&
     voiceServesModel(providerId, preference.voice, model, target.voices);
   return {
@@ -128,7 +161,8 @@ export function ttsSelection(
       ? preference.voice
       : defaultVoiceFor(providerId, model, target.options, target.voices),
     speed: preference.speed,
-    providersConfig: slotTTSProvidersConfig(target),
+    ...(accountScope ? { accountScope } : {}),
+    providersConfig: slotTTSProvidersConfig(target, accountVoices),
   };
 }
 
